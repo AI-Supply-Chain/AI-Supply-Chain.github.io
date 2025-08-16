@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Graph Visualization Interface - Graphviz</title>
+
+  <!-- External Libraries -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- HEADER -->
+    <div class="header">
+      <h1>AI Supply Chain Visualization and Analysis</h1>
+      <p>Load LLMGraph.dot file and perform forward & backward traversal with Graphviz rendering</p>
+    </div>
+
+    <!-- FILE PATH CONFIG -->
+    <div class="file-path-section">
+      <div class="input-group">
+        <label for="filePath">📁 Graph File Path</label>
+        <input type="text" id="filePath" placeholder="Enter path to the LLMGraph.dot file" value="LLMGraph.dot" />
+        <small style="color:#666;">Change this to your actual file path.</small>
+      </div>
+    </div>
+
+    <!-- Choose Start Node from CSV -->
+    <div class="input-group">
+      <label for="startNodeSelect">Choose from the below list</label>
+      <div class="select-row">
+        <select id="startNodeSelect">
+          <option value="">— load a list —</option>
+        </select>
+        <button type="button" class="secondary" onclick="useSelectedStartNode()">🔎 Search</button>
+      </div>
+      <small style="color:#666; display:block; margin-top:6px;"></small>
+    </div>
+
+    <!-- INPUT SECTION -->
+    <div class="input-section">
+      <div class="grid">
+        <!-- Row 1: full width -->
+        <div class="input-group span-2">
+          <label for="startNode">Starting Model Name</label>
+          <input type="text" id="startNode" placeholder="Enter model name from the Supply Chain graph" />
+        </div>
+
+        <!-- Row 2: Algorithm | Direction -->
+        <div class="input-group">
+          <label for="algorithm">Algorithm</label>
+          <select id="algorithm">
+            <option value="DFS">Forward Graph Analysis</option>
+            <option value="BFS">Backward Graph Analysis</option>
+          </select>
+        </div>
+
+        <div class="input-group">
+          <label for="direction">Direction</label>
+          <select id="direction">
+            <option value="downstream">⬇️ Downstream</option>
+            <option value="upstream">⬆️ Upstream</option>
+          </select>
+        </div>
+
+        <!-- Row 3: Max Depth | Layout -->
+        <div class="input-group">
+          <label for="maxDepth">Desired Graph Depth Level (Upto 50)</label>
+          <input type="number" id="maxDepth" value="5" min="1" max="50" />
+        </div>
+
+        <div class="input-group">
+          <label for="layout">Layout</label>
+          <select id="layout">
+            <option value="dot">dot (hierarchical)</option>
+            <option value="neato">neato</option>
+            <option value="fdp">fdp</option>
+            <option value="circo">circo</option>
+            <option value="twopi">twopi</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTION BUTTONS -->
+    <div class="button-group">
+      <button onclick="performTraversal()">🚀 Run Traversal</button>
+      <button onclick="showGraphStats()" class="secondary">📊 Stats</button>
+      <button onclick="loadFullGraph()" class="secondary">📈 Full Graph</button>
+      <button onclick="clearResults()" class="secondary">🗑️ Clear</button>
+    </div>
+
+    <!-- STATUS (kept inside the container) -->
+    <div id="status" class="status" style="display:none;"></div>
+
+    <!-- OUTPUT SECTION (kept inside the same container) -->
+    <div class="output-section">
+      <div class="grid">
+        <div>
+          <h2>Visualization</h2>
+          <div id="graphviz-container">
+            <div style="text-align:center; padding:50px; color:#666;">
+              Enter model name and run traversal
+            </div>
+          </div>
+        </div>
+        <div>
+          <h2>DOT Format Output</h2>
+          <textarea class="dot-textarea" id="dotOutput" readonly></textarea>
+          <div style="margin-top:10px;">
+            <button onclick="copyDotFormat()" class="secondary">📋 Copy</button>
+            <button onclick="downloadDotFile()" class="secondary">⬇️ Download</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div><!-- /container -->
+
+  <!-- Your JS Files -->
+  <script src="js/ui.js"></script>
+  <script src="js/graph-logic.js"></script>
+</body>
+</html>
