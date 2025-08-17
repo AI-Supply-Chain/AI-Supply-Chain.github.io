@@ -1,679 +1,872 @@
-// js/graph-logic.js
-// Traversal, parsing, D3 rendering, and bootstrapping (optimized DFS/BFS like your Python)
+'use strict';
 
-// ------------------------------
-// Global state
-// ------------------------------
-let fullGraph = {};        // { node: [neighbors...] } downstream
-let reverseGraph = {};     // { node: [parents...] }   upstream
+/* =========================
+   GLOBAL STATE (main thread)
+   ========================= */
+let fullGraph = {};
+let reverseGraph = {};
 let dotFileLines = [];
-let nodeLabelsGlobal = {}; // { id: "label" }
+let nodeLabelsGlobal = {};
+let MODEL_CHOICES = [];
+let __sigmaRenderer = null;
+let __d3Cleanup = null;
+let worker = null;
+let currentRunId = 0; // cancel token for concurrent runs
+
+// Expose for Stats pane
 window.fullGraph = fullGraph;
 window.reverseGraph = reverseGraph;
 window.nodeLabelsGlobal = nodeLabelsGlobal;
 window.lastDirection = 'downstream';
 
-// ------------------------------
-// Init
-// ------------------------------
-window.addEventListener('load', async function () {
-  console.log('Initializing Graph Traversal Tool');
-  showStatus('Loading engine...', '');
-  const loaded = await initGraphviz();
-  if (loaded) showStatus('Ready — enter file path and model name to begin traversal', 'success');
+/* =========================
+   TUNABLES
+   ========================= */
+const BIG_NODES = 250;           // switch to WebGL/Sigma above this
+const BIG_EDGES = 400;
 
-  // Preload dropdown models from CSV (adjust filename if needed)
-  loadStartNodes('llmgraph_base_models_forward.csv').catch(() => {});
+const MAX_SVG_LABEL_NODES = 150; // show SVG labels only if <= this
+const MAX_SVG_ARROW_EDGES = 300; // draw arrowheads only if <= this
+const MAX_FORCE_TICKS = 320;     // cap D3 tick count
+
+// datalist (29k) behaviour
+const DL_MIN_CHARS = 2;
+const DL_MAX_SUGGESTIONS = 500;
+const DL_CHUNK = 100;
+
+/* =========================
+   BOOT
+   ========================= */
+window.addEventListener('load', async () => {
+  try {
+    showStatus('Loading…', '');
+    await loadStartNodes('AI-SCG-Forward-Analysis.csv', 'base_model');
+    const layoutSel = document.getElementById('layout');
+    if (layoutSel) layoutSel.disabled = true;
+    initWorker();
+    showStatus('Ready — enter a file path and model to begin', 'success');
+  } catch (e) {
+    console.error(e);
+    showStatus(`Init error: ${e.message}`, 'error');
+  }
 });
 
-async function initGraphviz() {
-  if (typeof d3 !== 'undefined') {
-    console.log('Using D3.js for visualization');
-    return true;
-  }
-  showStatus('Using simple text rendering', 'info');
-  return false;
-}
-
-// ------------------------------
-// CSV dropdown
-// ------------------------------
+/* =========================
+   START NODE LIST (29k safe)
+   ========================= */
 async function loadStartNodes(csvPath, column = 'base_model') {
-  try {
-    const path = (csvPath || document.getElementById('startNodeCsvPath')?.value || 'llmgraph_base_models_forward.csv').trim();
-    if (!path) { showStatus('Provide a CSV path.', 'error'); return; }
-    if (typeof d3 === 'undefined' || !d3.csv) { showStatus('d3.csv is not available', 'error'); return; }
+  if (!d3 || !d3.csv) { showStatus('d3.csv is not available', 'error'); return; }
+  const data = await d3.csv((csvPath || '').trim());
+  const normalized = data.map(row => {
+    const out = {};
+    for (const k in row) out[k.trim().toLowerCase()] = (row[k] ?? '').trim();
+    return out;
+  });
+  const colKey = Object.keys(normalized[0] || {}).find(k => k === String(column).toLowerCase()) || String(column).toLowerCase();
 
-    const data = await d3.csv(path);
-    const uniq = new Set();
-    for (const row of data) {
-      const v = (row[column] || '').trim();
-      if (v) uniq.add(v);
-    }
+  const uniq = new Set(); for (const r of normalized) { const v = (r[colKey] || ''); if (v) uniq.add(v); }
+  MODEL_CHOICES = Array.from(uniq).sort((a,b)=>a.localeCompare(b));
+  const MODEL_CHOICES_LC = MODEL_CHOICES.map(s => s.toLowerCase());
 
-    const select = document.getElementById('startNodeSelect');
-    if (!select) return;
-
-    const values = Array.from(uniq).sort((a, b) => a.localeCompare(b));
-    select.innerHTML = '<option value="">— select a model —</option>' +
-      values.map(v => `<option value="${v.replace(/"/g, '&quot;')}">${v}</option>`).join('');
-
-    showStatus(`Loaded ${values.length} models from ${path}`, 'success');
-  } catch (err) {
-    console.error(err);
-    showStatus(`Failed to load CSV: ${err.message}`, 'error');
-  }
-}
-
-function useSelectedStartNode() {
-  const sel = document.getElementById('startNodeSelect');
-  if (!sel || !sel.value) { showStatus('Pick a model from the list first.', 'error'); return; }
-  const input = document.getElementById('startNode');
-  if (input) input.value = sel.value;
-  performTraversal();
-}
-
-// ------------------------------
-// DOT parsing (single pass, robust for common cases)
-// ------------------------------
-function parseDot(dotText) {
-  const full = {};
-  const rev  = {};
-  const labels = {};
-  const lines = dotText.split(/\r?\n/);
-
-  for (let raw of lines) {
-    const line = raw.trim();
-    if (!line || line === '{' || line === '}' || line.startsWith('//') || line.startsWith('#')) continue;
-    if (/\bdigraph\b|\bgraph\b/.test(line)) continue;
-
-    // Node with label (quoted or bare ids; allow ., -, /)
-    const nodeMatchQuoted = line.match(/^"([^"]+)"\s*\[.*label="([^"]+)".*\]/);
-    const nodeMatchBare   = line.match(/^([\w./-]+)\s*\[.*label="([^"]+)".*\]/);
-    if (nodeMatchQuoted || nodeMatchBare) {
-      const id    = (nodeMatchQuoted ? nodeMatchQuoted[1] : nodeMatchBare[1]);
-      const label = (nodeMatchQuoted ? nodeMatchQuoted[2] : nodeMatchBare[2]);
-      labels[id] = label;
-      if (!full[id]) full[id] = [];
-      if (!rev[id])  rev[id]  = [];
-      continue;
-    }
-
-    // Edge: "a" -> "b"  OR  a -> b  (support bare ids with ., -, /)
-    const edgeMatch =
-      line.match(/"([^"]+)"\s*->\s*"([^"]+)"/) ||
-      line.match(/([\w./-]+)\s*->\s*([\w./-]+)/);
-
-    if (edgeMatch) {
-      let from = edgeMatch[1].trim();
-      let to   = edgeMatch[2].trim();
-
-      // normalize numeric ids (strip leading zeros)
-      if (/^0+\d+$/.test(from)) from = from.replace(/^0+/, '') || '0';
-      if (/^0+\d+$/.test(to))   to   = to.replace(/^0+/, '') || '0';
-
-      (full[from] ||= []).push(to);
-      (full[to]   ||= []);
-      (rev[to]    ||= []).push(from);
-      (rev[from]  ||= []);
-      continue;
-    }
-  }
-
-  return { full, rev, labels, lines };
-}
-
-// ------------------------------
-// Traversals (Python-like semantics)
-// ------------------------------
-function traverseDFS(graphObj, start, maxDepth, direction /* 'downstream' | 'upstream' */) {
-  const stack = [[start, 0]];
-  const visited = new Set();
-  const order = [];
-  const edges = [];
-  const levels = new Map([[start, 0]]);
-  const parent = new Map();
-
-  while (stack.length) {
-    const [node, depth] = stack.pop();
-    if (visited.has(node)) continue;
-    visited.add(node);
-    order.push(node);
-
-    const neighbors = graphObj[node] || [];
-    for (let i = neighbors.length - 1; i >= 0; i--) {
-      const nb = neighbors[i];
-
-      // direction for edge arrows (visual only)
-      if (direction === 'upstream') {
-        edges.push({ from: nb, to: node, level: depth + 1 });
-      } else {
-        edges.push({ from: node, to: nb, level: depth + 1 });
+  const inputTA = document.getElementById('startNodeTypeahead');
+  const dataList = document.getElementById('modelOptions');
+  if (inputTA && dataList) {
+    clearOptions(dataList);
+    const onInput = debounce(() => {
+      const q = (inputTA.value || '').toLowerCase();
+      if (q.length < DL_MIN_CHARS) { clearOptions(dataList); return; }
+      const matches = [];
+      for (let i=0; i<MODEL_CHOICES_LC.length; i++) {
+        if (MODEL_CHOICES_LC[i].includes(q)) {
+          matches.push(MODEL_CHOICES[i]);
+          if (matches.length >= DL_MAX_SUGGESTIONS) break;
+        }
       }
-
-      if (!visited.has(nb) && depth + 1 <= maxDepth) {
-        if (!levels.has(nb)) levels.set(nb, depth + 1);
-        if (!parent.has(nb)) parent.set(nb, node);
-        stack.push([nb, depth + 1]);
-      }
-    }
+      renderOptionsChunked(dataList, matches, DL_CHUNK);
+    }, 120);
+    inputTA.addEventListener('input', onInput);
+    inputTA.addEventListener('keydown', (e) => { if (e.key === 'Enter') { copySelectedModelToStartField(); e.preventDefault(); }});
   }
+  showStatus(`Loaded ${MODEL_CHOICES.length} models from CSV`, 'success');
+}
+function useSelectedStartNode(){ copySelectedModelToStartField(); }
+function copySelectedModelToStartField(){
+  const startField = document.getElementById('startNode');
+  const ta = document.getElementById('startNodeTypeahead');
+  const chosen = (ta?.value || '').trim();
+  if (!chosen) return showStatus('Type or choose a model first.', 'error');
+  startField.value = chosen; showStatus('Model copied. Click Run Traversal.', 'success');
+}
+window.useSelectedStartNode = useSelectedStartNode;
 
-  // Build parent paths
-  const paths = new Map();
-  for (const n of order) {
-    const p = [];
-    let cur = n;
-    while (cur !== undefined) {
-      p.unshift(cur);
-      cur = parent.get(cur);
-    }
-    if (!paths.has(n)) paths.set(n, p);
+function clearOptions(dl){ if (dl) dl.innerHTML = ''; }
+function renderOptionsChunked(dl, arr, chunkSize=100){
+  if (!dl) return; dl.innerHTML = ''; let i=0;
+  function appendChunk(){
+    const frag = document.createDocumentFragment();
+    const end = Math.min(i + chunkSize, arr.length);
+    for (; i<end; i++){ const opt = document.createElement('option'); opt.value = arr[i]; frag.appendChild(opt); }
+    dl.appendChild(frag);
+    if (i < arr.length) requestAnimationFrame(appendChunk);
   }
+  requestAnimationFrame(appendChunk);
+}
+function debounce(fn, ms){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), ms); }; }
 
-  return { order, edges, levels, paths };
+/* =========================
+   WEB WORKER
+   ========================= */
+function initWorker() {
+  if (worker) try { worker.terminate(); } catch {}
+  const blob = new Blob([WORKER_SOURCE], { type: 'application/javascript' });
+  worker = new Worker(URL.createObjectURL(blob));
+  worker.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'progress') {
+      if (msg.phase === 'fetch') showStatus('Loading graph file…', '');
+      else if (msg.phase === 'parse') showStatus(`Parsing DOT… ${msg.lines||0} lines`, '');
+      else if (msg.phase === 'traverse') showStatus(`Traversing (${msg.algorithm})…`, '');
+      else if (msg.phase === 'prep') showStatus(`Preparing visualization…`, '');
+    } else if (msg.type === 'result') {
+      if (msg.runId !== currentRunId) return; // stale
+      // Update globals for Stats feature
+      fullGraph = msg.fullGraph; reverseGraph = msg.reverseGraph; nodeLabelsGlobal = msg.labels; dotFileLines = msg.dotLines;
+      window.fullGraph = fullGraph; window.reverseGraph = reverseGraph; window.nodeLabelsGlobal = nodeLabelsGlobal;
+
+      // Update DOT textarea
+      const outTa = document.getElementById('dotOutput'); if (outTa) outTa.value = msg.dot;
+
+      // Render
+      renderGraph({ nodes: msg.nodes, edges: msg.edges, maxLevel: msg.maxLevel })
+        .then(() => {
+          const caption = (msg.direction === 'downstream') ? 'Forward subgraph analysis complete' : 'Backward subgraph analysis complete';
+          showStatus(`${caption}: ${msg.nodes.length} nodes, ${msg.edges.length} edges, ${msg.maxLevel + 1} levels`, 'success');
+        })
+        .catch(e => showStatus(`Render error: ${e.message}`, 'error'));
+    } else if (msg.type === 'error') {
+      if (msg.runId !== currentRunId) return;
+      showStatus(`Error: ${msg.message}`, 'error');
+    }
+  };
 }
 
-function traverseBFS(graphObj, start, maxDepth, direction /* 'downstream' | 'upstream' */) {
-  const queue = [[start, 0]];
-  let qi = 0;
-  const visited = new Set([start]);
-  const order = [];
-  const edges = [];
-  const levels = new Map([[start, 0]]);
-  const parent = new Map();
-
-  while (qi < queue.length) {
-    const [node, depth] = queue[qi++];
-    order.push(node);
-
-    const neighbors = graphObj[node] || [];
-    for (const nb of neighbors) {
-      if (direction === 'upstream') {
-        edges.push({ from: nb, to: node, level: depth + 1 });
-      } else {
-        edges.push({ from: node, to: nb, level: depth + 1 });
-      }
-
-      if (!visited.has(nb) && depth + 1 <= maxDepth) {
-        visited.add(nb);
-        levels.set(nb, depth + 1);
-        if (!parent.has(nb)) parent.set(nb, node);
-        queue.push([nb, depth + 1]);
-      }
-    }
-  }
-
-  // Build parent paths
-  const paths = new Map();
-  for (const n of order) {
-    const p = [];
-    let cur = n;
-    while (cur !== undefined) {
-      p.unshift(cur);
-      cur = parent.get(cur);
-    }
-    if (!paths.has(n)) paths.set(n, p);
-  }
-
-  return { order, edges, levels, paths };
-}
-
-// ------------------------------
-// Main action
-// ------------------------------
+/* =========================
+   MAIN ACTIONS
+   ========================= */
 async function performTraversal() {
-  const startNodeInput = document.getElementById('startNode');
-  const algorithmInput = document.getElementById('algorithm');  // 'DFS' or 'BFS'
-  const maxDepthInput  = document.getElementById('maxDepth');
-  const layoutInput    = document.getElementById('layout');
-  const directionInput = document.getElementById('direction');  // 'downstream' | 'upstream'
-  const filePathInput  = document.getElementById('filePath');
-
-  const startNode = (startNodeInput.value || '').trim();
-  const algorithm = (algorithmInput.value || 'DFS').trim();
-  const maxDepth  = parseInt(maxDepthInput.value, 10);
-  const layout    = (layoutInput.value || 'dot').trim();
-  const direction = (directionInput.value || 'downstream').trim();
-  const filePath  = (filePathInput.value || '').trim();
+  const startNode = (document.getElementById('startNode')?.value || '').trim();
+  const algorithm = (document.getElementById('algorithm')?.value || 'DFS').trim();
+  let maxDepth = parseInt(document.getElementById('maxDepth')?.value ?? '5', 10);
+  const direction = (document.getElementById('direction')?.value || 'downstream').trim();
+  const filePath = (document.getElementById('filePath')?.value || '').trim();
 
   if (!startNode) return showStatus('Please enter a valid start node.', 'error');
   if (!filePath)  return showStatus('Please enter a valid file path.', 'error');
+  if (!Number.isFinite(maxDepth) || maxDepth < 1) maxDepth = 1; if (maxDepth > 50) maxDepth = 50;
 
-  try {
-    showStatus('Loading graph file from: ' + filePath, '');
+  const fileURL = toAbsoluteURL(filePath); // Live Server fix
 
-    const response = await fetch(filePath);
-    if (!response.ok) throw new Error(`Failed to load ${filePath}: ${response.status}`);
-    const dotText = await response.text();
+  // cancel previous
+  currentRunId++;
+  initWorker();
+  showStatus('Loading graph file…', '');
 
-    // Parse once
-    const { full, rev, labels, lines } = parseDot(dotText);
-    fullGraph = full;
-    reverseGraph = rev;
-    nodeLabelsGlobal = labels;
-    dotFileLines = lines;
-
-    // Keep globals exposed for ui.js
-    window.fullGraph = fullGraph;
-    window.reverseGraph = reverseGraph;
-    window.nodeLabelsGlobal = nodeLabelsGlobal;
-
-    showStatus('Parsing complete. Building traversal…', '');
-
-    // Choose graph by direction
-    const graphToUse = (direction === 'upstream') ? reverseGraph : fullGraph;
-    const directionLabel = (direction === 'upstream') ? 'upstream' : 'downstream';
-    window.lastDirection = direction;
-
-    // Locate start node (exact, cleaned, or partial)
-    let actualStart = resolveStartNode(graphToUse, startNode);
-    if (!actualStart) {
-      const candidates = Object.keys(graphToUse).slice(0, 10);
-      showStatus(`Start node "${startNode}" not found in ${directionLabel} graph. Examples: ${candidates.join(', ')}…`, 'error');
-      return;
-    }
-
-    // Run traversal (Python-like)
-    showStatus(`Running ${algorithm} ${directionLabel} traversal from "${actualStart}"…`, '');
-    const result = (algorithm === 'DFS')
-      ? traverseDFS(graphToUse, actualStart, maxDepth, direction)
-      : traverseBFS(graphToUse, actualStart, maxDepth, direction);
-
-    const { order, edges, levels, paths } = result;
-
-    if (!order.length) {
-      showStatus(`No nodes found in ${directionLabel} traversal.`, 'error');
-      return;
-    }
-
-    // Summaries
-    const maxLevel = Math.max(...levels.values());
-    const baseAtMax = [];
-    for (const [n, lvl] of levels.entries()) if (lvl === maxLevel) baseAtMax.push(n);
-    const avgPathLength = Array.from(paths.values()).reduce((s, p) => s + (p.length - 1), 0) / Math.max(paths.size, 1);
-
-    // DOT output & render
-    const dotOutput = generateTraversalDot(order, edges, algorithm, actualStart, direction, levels, paths);
-    document.getElementById('dotOutput').value = dotOutput;
-
-    showStatus('Rendering visualization…', '');
-    await renderWithGraphviz(dotOutput, layout);
-
-    const analysisLabel = (direction === 'downstream')
-      ? 'Forward subgraph analysis complete'
-      : 'Backward subgraph analysis complete';
-
-    showStatus(
-      `${analysisLabel}: ${order.length} nodes, ${edges.length} edges, ${maxLevel + 1} levels`,
-      'success'
-    );
-  } catch (err) {
-    console.error('Error:', err);
-    showStatus(`Error: ${err.message}`, 'error');
-  }
+  worker.postMessage({
+    type: 'traverse',
+    runId: currentRunId,
+    filePath: fileURL,
+    startNode, direction, algorithm, maxDepth
+  });
 }
+window.performTraversal = performTraversal;
 
-// Try exact → cleaned numeric → partial match
-function resolveStartNode(graphObj, userInput) {
-  if (graphObj[userInput]) return userInput;
-  const cleaned = userInput.replace(/^0+/, '') || '0';
-  if (graphObj[cleaned]) return cleaned;
-
-  const lower = userInput.toLowerCase();
-  const found = Object.keys(graphObj).find(k => k.toLowerCase().includes(lower) || lower.includes(k.toLowerCase()));
-  if (found) return found;
-
-  // If it only appears as a target, create an empty entry so traversal starts
-  for (const tgts of Object.values(graphObj)) {
-    if (tgts.includes(userInput) || tgts.includes(cleaned)) {
-      if (!graphObj[userInput]) graphObj[userInput] = [];
-      return userInput;
-    }
-  }
-  return null;
-}
-
-// ------------------------------
-// Full-graph viewing
-// ------------------------------
 async function loadFullGraph() {
   try {
     showStatus('Loading full graph…', '');
-    const filePath = document.getElementById('filePath').value.trim();
-    if (!filePath) return showStatus('Please enter a valid file path.', 'error');
-    const response = await fetch(filePath);
-    if (!response.ok) throw new Error(`Failed to load ${filePath}: ${response.status}`);
-
-    const dotText = await response.text();
-    const layout = document.getElementById('layout').value;
-    await renderWithGraphviz(dotText, layout);
+    const fp = document.getElementById('filePath').value.trim(); if (!fp) return showStatus('Please enter a valid file path.', 'error');
+    const abs = toAbsoluteURL(fp);
+    const res = await fetch(abs); if (!res.ok) throw new Error(`Failed to load ${abs}: ${res.status}`);
+    const dotText = await res.text();
     document.getElementById('dotOutput').value = dotText;
+    await renderGraph(dotText);
     showStatus('Full graph loaded successfully', 'success');
-  } catch (error) {
-    console.error('Error loading full graph:', error);
-    showStatus(`Error loading full graph: ${error.message}`, 'error');
-  }
+  } catch (e) { console.error(e); showStatus(`Error loading full graph: ${e.message}`, 'error'); }
+}
+window.loadFullGraph = loadFullGraph;
+
+function toAbsoluteURL(p) {
+  try { return new URL(p, window.location.href).href; }
+  catch { return p; }
 }
 
-// ------------------------------
-// Rendering
-// ------------------------------
-async function renderWithGraphviz(dotContent, layout = 'dot') {
+/* =========================
+   RENDERING (chooses engine)
+   ========================= */
+async function renderGraph(input) {
   const container = document.getElementById('graphviz-container');
-  try {
-    if (typeof d3 !== 'undefined') {
-      renderWithD3(dotContent, container);
-      return;
+  try { if (__sigmaRenderer && typeof __sigmaRenderer.kill === 'function') __sigmaRenderer.kill(); } catch {}
+  __sigmaRenderer = null;
+  if (__d3Cleanup) { try { __d3Cleanup(); } catch {}; __d3Cleanup = null; }
+  container.innerHTML = '';
+
+  if (typeof input === 'string') {
+    const { nodeCount, edgeCount } = countDotNodesEdges(input);
+    const huge = nodeCount > BIG_NODES || edgeCount > BIG_EDGES;
+    if (huge)      await renderWithSigmaFastFromDot(input, container);
+    else {
+      const { nodes, edges } = parseNodesEdgesFromDot(input);
+      await renderWithD3ForceSmall(nodes, edges, container);
     }
-    renderTextFallback(dotContent, container);
-  } catch (error) {
-    console.error('Rendering error:', error);
-    renderTextFallback(dotContent, container);
-    showStatus('Using text fallback due to rendering error', 'error');
+    return;
   }
+
+  const nodes = input.nodes || [];
+  const edges = input.edges || [];
+  const huge = nodes.length > BIG_NODES || edges.length > BIG_EDGES;
+  if (huge) await renderWithSigmaLayered(nodes, edges, container);
+  else      await renderWithD3ForceSmall(nodes, edges, container);
 }
 
-function renderWithD3(dotContent, container) {
-  const lines = dotContent.split('\n');
-  const nodes = new Map();
-  const edges = [];
+function countDotNodesEdges(dotContent) {
+  const nodeMatches = dotContent.match(/^\s*"?[^"\n]+"?\s*\[/gm) || [];
+  const edgeMatches = dotContent.match(/"[^"]+"\s*->\s*"[^"]+"/g) || dotContent.match(/[\w./-]+\s*->\s*[\w./-]+/g) || [];
+  return { nodeCount: nodeMatches.length, edgeCount: edgeMatches.length };
+}
 
-  // Parse nodes & edges from DOT we generate (includes Level/Steps and [BASE]/[TERMINAL])
-  lines.forEach(line => {
-    // Node
-    const nodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+)\\nLevel:\s*(\d+)(?:\\nSteps:\s*(\d+))?(?:\\n\[(?:BASE|TERMINAL)\])?".*\]/);
+/* =========================
+   DOT→nodes/edges (self-loop safe)
+   ========================= */
+function parseNodesEdgesFromDot(dotContent) {
+  const lines = dotContent.split('\n'); const nodes = []; const edges = [];
+  for (const line of lines) {
+    const nodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+?)\\nLevel:\s*(\d+)(?:\\nSteps:\s*(\d+))?(?:\\n\[(?:BASE|TERMINAL)\])?".*\]/);
     if (nodeMatch) {
-      const id = nodeMatch[1];
-      const label = nodeMatch[2];
-      const level = parseInt(nodeMatch[3], 10);
-      const steps = nodeMatch[4] ? parseInt(nodeMatch[4], 10) : level;
-      const isBase = line.includes('[BASE]');
-      const isTerminal = line.includes('[TERMINAL]');
-      const isExtreme  = isBase || isTerminal;
-      nodes.set(id, { id, label, level, steps, isBase, isTerminal, isExtreme, group: level });
-      return;
+      const id = unquote(nodeMatch[1]); const label = nodeMatch[2];
+      const level = parseInt(nodeMatch[3],10)||0; const isBase = line.includes('[BASE]'); const isTerminal = line.includes('[TERMINAL]');
+      nodes.push({ id, display:label, level, isExtreme:isBase||isTerminal }); continue;
     }
-
-    // Node (no steps / no marker)
-    const simpleNodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+)\\nLevel:\s*(\d+)".*\]/);
+    const simpleNodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+?)\\nLevel:\s*(\d+)".*\]/);
     if (simpleNodeMatch) {
-      const id = simpleNodeMatch[1];
-      const label = simpleNodeMatch[2];
-      const level = parseInt(simpleNodeMatch[3], 10);
-      nodes.set(id, { id, label, level, steps: level, isBase: false, isTerminal: false, isExtreme: false, group: level });
-      return;
+      const id = unquote(simpleNodeMatch[1]); const label = simpleNodeMatch[2]; const level = parseInt(simpleNodeMatch[3],10)||0;
+      nodes.push({ id, display:label, level, isExtreme:false }); continue;
     }
-
-    // Edge
     const edgeMatch = line.match(/"([^"]+)"\s*->\s*"([^"]+)"/);
-    if (edgeMatch) edges.push({ source: edgeMatch[1], target: edgeMatch[2] });
-  });
+    if (edgeMatch) {
+      const s = unquote(edgeMatch[1]);
+      const t = unquote(edgeMatch[2]);
+      if (s === t) continue; // skip self-loop
+      edges.push({ source: s, target: t });
+    }
+  }
+  return {
+    nodes,
+    edges: dedupeEdges(edges.map(e => ({ from:e.source, to:e.target })))
+             .map(e => ({ source:e.from, target:e.to }))
+  };
+}
 
-  const nodeArray = Array.from(nodes.values());
-  const edgeArray = edges;
+function dedupeEdges(edges) {
+  const seen = new Set(), out = [];
+  for (const e of edges) {
+    if (e.from === e.to) continue;
+    const key = `${e.from}->${e.to}`;
+    if (seen.has(key)) continue;
+    seen.add(key); out.push(e);
+  }
+  return out;
+}
 
-  container.innerHTML = '';
+/* =========================
+   D3 (SMALL GRAPHS)
+   ========================= */
+async function renderWithD3ForceSmall(nodes, edges, container) {
   const width = container.clientWidth || 1200;
-  const height = 800;
+  const height = Math.max(700, container.clientHeight || 700);
 
-  const svg = d3.select(container).append('svg').attr('width', width).attr('height', height);
+  const svg = d3.select(container).append('svg').attr('width', width).attr('height', height).style('background', '#ffffff');
   const g = svg.append('g');
+  const zoom = d3.zoom().scaleExtent([0.1, 4]).on('zoom', (event)=> g.attr('transform', event.transform)); svg.call(zoom);
 
-  const zoom = d3.zoom().scaleExtent([0.1, 4]).on('zoom', (event) => g.attr('transform', event.transform));
-  svg.call(zoom);
+  const showLabels = nodes.length <= MAX_SVG_LABEL_NODES;
+  const useArrows = edges.length <= MAX_SVG_ARROW_EDGES;
+  if (useArrows) {
+    svg.append('defs').append('marker')
+      .attr('id', 'arrowhead').attr('viewBox', '0 -5 10 10')
+      .attr('refX', 16).attr('refY', 0).attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
+      .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#666');
+  }
 
-  const simulation = d3.forceSimulation(nodeArray)
-    .force('link', d3.forceLink(edgeArray).id(d => d.id).distance(150).strength(0.8))
-    .force('charge', d3.forceManyBody().strength(-400))
-    .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('collision', d3.forceCollide().radius(25))
-    .force('y', d3.forceY(d => (d.level || 0) * 100 + height / 2).strength(0.3));
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(edges).id(d=>d.id).distance(95).strength(0.8))
+    .force('charge', d3.forceManyBody().strength(-220))
+    .force('center', d3.forceCenter(width/2, height/2))
+    .force('y', d3.forceY(d => (d.level||0) * 80 + height/2).strength(0.25));
 
-  const link = g.append('g').selectAll('line').data(edgeArray).enter().append('line')
-    .attr('stroke', '#999').attr('stroke-opacity', 0.6).attr('stroke-width', 2);
+  if (nodes.length <= 120) simulation.force('collision', d3.forceCollide().radius(16));
 
-  svg.append('defs').append('marker')
-    .attr('id', 'arrowhead').attr('viewBox', '0 -5 10 10')
-    .attr('refX', 25).attr('refY', 0)
-    .attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
-    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#666');
+  const link = g.append('g').selectAll('line').data(edges).enter().append('line')
+    .attr('stroke', '#999').attr('stroke-opacity', 0.7).attr('stroke-width', 1.8)
+    .attr('marker-end', useArrows ? 'url(#arrowhead)' : null);
 
-  link.attr('marker-end', 'url(#arrowhead)');
+  const maxLevel = Math.max(0, ...nodes.map(d => d.level || 0));
+  const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, maxLevel || 1]);
 
-  const maxLevel = Math.max(...nodeArray.map(d => d.level || 0), 0);
-  const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, maxLevel]);
-
-  const node = g.append('g').selectAll('circle').data(nodeArray).enter().append('circle')
-    .attr('r', d => d.isExtreme ? 16 : 12)
+  const node = g.append('g').selectAll('circle').data(nodes).enter().append('circle')
+    .attr('r', d => d.isExtreme ? 8 : 6)
     .attr('fill', d => colorScale(d.level || 0))
     .attr('stroke', d => d.isExtreme ? '#ff0000' : '#fff')
-    .attr('stroke-width', d => d.isExtreme ? 4 : 2)
+    .attr('stroke-width', d => d.isExtreme ? 2.4 : 1.6)
     .style('cursor', 'pointer');
 
-  const labels = g.append('g').selectAll('text.label').data(nodeArray).enter().append('text')
-    .attr('class', 'label')
-    .text(d => {
-      const display = d.label || d.id;
-      return display.length > 12 ? display.substring(0, 9) + '...' : display;
-    })
-    .attr('font-size', '10px').attr('font-family', 'Arial, sans-serif')
-    .attr('text-anchor', 'middle').attr('dy', -18).attr('fill', '#333')
-    .style('pointer-events', 'none');
+  let labels, levelLabels;
+  if (showLabels) {
+    labels = g.append('g').selectAll('text.label').data(nodes).enter().append('text')
+      .attr('class', 'label')
+      .text(d => (d.display || d.id).length > 12 ? (d.display || d.id).slice(0, 9) + '…' : (d.display || d.id))
+      .attr('font-size', '10px').attr('font-family', 'Arial, sans-serif')
+      .attr('text-anchor', 'middle').attr('dy', -18).attr('fill', '#333')
+      .style('pointer-events', 'none');
 
-  const levelLabels = g.append('g').selectAll('text.level').data(nodeArray).enter().append('text')
-    .attr('class', 'level')
-    .text(d => `L${d.level || 0}`)
-    .attr('font-size', '8px').attr('font-family', 'Arial, sans-serif')
-    .attr('text-anchor', 'middle').attr('dy', 4).attr('fill', '#fff')
-    .attr('font-weight', 'bold').style('pointer-events', 'none');
+    levelLabels = g.append('g').selectAll('text.level').data(nodes).enter().append('text')
+      .attr('class', 'level').text(d => `L${d.level || 0}`)
+      .attr('font-size', '8px').attr('font-family', 'Arial, sans-serif')
+      .attr('text-anchor', 'middle').attr('dy', 4).attr('fill', '#fff')
+      .attr('font-weight', 'bold').style('pointer-events', 'none');
+  }
+
+  const tip = document.createElement('div');
+  tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
+  container.appendChild(tip);
 
   node.on('mouseover', function (event, d) {
-    d3.select(this).attr('r', d.isExtreme ? 20 : 16);
-    const modelName = getModelNameForNode(d.id);
-    let displayText = `${modelName || d.label || d.id}`;
-    displayText += `\nLevel: ${d.level || 0}`;
-    displayText += `\nSteps: ${d.steps || 0}`;
-    if (d.isBase)        displayText += '\n[BASE MODEL]';
-    else if (d.isTerminal) displayText += '\n[TERMINAL NODE]';
+      tip.textContent = `${d.display || d.id} (Level ${d.level || 0})`;
+      tip.style.left = (event.offsetX + 12) + 'px';
+      tip.style.top  = (event.offsetY - 10) + 'px';
+      tip.style.display = 'block';
+      d3.select(this).attr('r', d.isExtreme ? 10 : 8);
+    })
+    .on('mousemove', function (event) {
+      tip.style.left = (event.offsetX + 12) + 'px';
+      tip.style.top  = (event.offsetY - 10) + 'px';
+    })
+    .on('mouseout', function (event, d) {
+      tip.style.display = 'none';
+      d3.select(this).attr('r', d.isExtreme ? 8 : 6);
+    });
 
-    g.append('text')
-      .attr('id', 'tooltip')
-      .attr('x', d.x)
-      .attr('y', d.y - 35)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', '12px')
-      .attr('font-weight', 'bold')
-      .attr('fill', '#000')
-      .attr('stroke', '#fff')
-      .attr('stroke-width', '3px')
-      .attr('paint-order', 'stroke fill')
-      .text(displayText);
-  }).on('mouseout', function () {
-    d3.select(this).attr('r', d3.select(this).attr('stroke-width') == 4 ? 16 : 12);
-    g.select('#tooltip').remove();
-  });
-
+  simulation.alpha(1).alphaDecay(0.08);
+  let ticks = 0;
   simulation.on('tick', () => {
-    link.attr('x1', d => d.source.x)
-        .attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x)
-        .attr('y2', d => d.target.y);
-
+    if (++ticks >= MAX_FORCE_TICKS || simulation.alpha() < 0.02) simulation.stop();
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
     node.attr('cx', d => d.x).attr('cy', d => d.y);
-    labels.attr('x', d => d.x).attr('y', d => d.y);
-    levelLabels.attr('x', d => d.x).attr('y', d => d.y);
+    if (showLabels) {
+      labels.attr('x', d => d.x).attr('y', d => d.y);
+      levelLabels.attr('x', d => d.x).attr('y', d => d.y);
+    }
   });
 
   node.call(d3.drag()
-    .on('start', dragstarted)
-    .on('drag', dragged)
-    .on('end', dragended));
+    .on('start', (event, d) => { if (!event.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+    .on('drag',  (event, d) => { d.fx = event.x; d.fy = event.y; })
+    .on('end',   (event, d) => { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
 
-  function dragstarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
-    d.fx = d.x; d.fy = d.y;
-  }
-  function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
-  function dragended(event, d) { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }
+  const helper = document.createElement('div');
+  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
+  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br>• Drag nodes: move<br><br><strong>Legend:</strong><br>• Color = depth level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  container.appendChild(helper);
 
-  // Floating help (direction-aware legend)
-  const controls = container.appendChild(document.createElement('div'));
-  controls.style.cssText = 'position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 5px; font-size: 12px;';
-  const redMeaning = (window.lastDirection === 'downstream')
-    ? 'Red border: Terminal nodes'
-    : 'Red border: Base models';
-  controls.innerHTML = `
-    <strong>Controls:</strong><br>
-    • Mouse wheel: Zoom<br>
-    • Drag background: Pan<br>
-    • Drag nodes: Move<br>
-    • Hover nodes: See details<br>
-    <br><strong>Legend:</strong><br>
-    • Node colors: Level depth<br>
-    • L# inside nodes: Level number<br>
-    • ${redMeaning}<br>
-    • Level 0: Starting node`;
+  __d3Cleanup = () => { try { simulation.stop(); } catch {}; try { svg.remove(); } catch {}; try { tip.remove(); } catch {}; try { helper.remove(); } catch {}; };
 }
 
-function renderTextFallback(dotContent, container) {
-  const lines = dotContent.split('\n');
-  let html = '<div style="font-family: monospace; padding: 20px;">';
-  html += '<h3>Graph Structure (Text View)</h3>';
-  const edges = []; const nodes = new Set();
-  lines.forEach(line => {
-    const m = line.match(/"([^"]+)"\s*->\s*"([^"]+)"/);
-    if (m) { edges.push({ from: m[1], to: m[2] }); nodes.add(m[1]); nodes.add(m[2]); }
-  });
-  html += `<p><strong>Nodes:</strong> ${nodes.size}</p>`;
-  html += `<p><strong>Edges:</strong> ${edges.length}</p><br>`;
-  html += '<div style="border: 1px solid #ccc; padding: 10px; max-height: 400px; overflow-y: auto;">';
-  edges.forEach(e => { html += `<div style="margin: 5px 0;">${e.from} → ${e.to}</div>`; });
-  html += '</div></div>';
-  container.innerHTML = html;
-}
+/* =========================
+   SIGMA (BIG GRAPHS)
+   Now with hover tooltip + Controls/Legend overlay,
+   labels appear only when zoomed in (label threshold).
+   ========================= */
+async function renderWithSigmaLayered(nodes, edges, container) {
+  await loadScriptOnce('https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js', () => !!window.graphology);
+  await loadScriptOnce('https://unpkg.com/sigma@2.4.0/build/sigma.min.js', () => !!window.Sigma || !!window.sigma);
+  const Graph = window.graphology?.Graph; const SigmaCtor = window.Sigma || window.sigma;
+  if (!Graph || !SigmaCtor) throw new Error('Sigma/Graphology failed to load.');
 
-// ------------------------------
-// DOT generation + helpers
-// ------------------------------
-function generateTraversalDot(order, edges, algorithm, startNode, direction, nodeLevels, nodePaths) {
-  const sanitize = s => (s || '').replace(/[^a-zA-Z0-9._-]/g, '_');
-  const isDown = direction === 'downstream';
+  const graph = new Graph({ multi:false, allowSelfLoops:false });
 
-  const graphTitle = isDown
-    ? `Forward_Subgraph_Analysis_of_${sanitize(startNode)}`
-    : `Backward_Subgraph_Analysis_of_${sanitize(startNode)}`;
+  const rect = container.getBoundingClientRect(); const width = rect.width || 1200; const height = Math.max(700, rect.height || 700);
+  const levels = new Map(); let maxLevel = 0;
+  for (const n of nodes) { const l = n.level||0; maxLevel=Math.max(maxLevel,l); (levels.get(l) || levels.set(l, []).get(l)).push?.(n) || levels.get(l).push(n); }
 
-  let output = `digraph "${graphTitle}" {\n`;
-  // output += `    rankdir=TB;\n`;  // leave off when using force layout
-  output += `    node [shape=box, style=filled];\n`;
-  output += `    edge [color=blue];\n\n`;
+  const topPad=80, bottomPad=60, leftPad=80, rightPad=60;
+  const rows = Math.max(1, maxLevel + 1);
+  const levelGap=Math.max(90,(height-topPad-bottomPad)/rows);
+  const yFor = l => topPad + l*levelGap;
 
-  // Summary
-  output += `    // Nodes visited: ${order.length}\n`;
-  output += `    // Edges found: ${edges.length}\n`;
+  const palette = ['#440154','#482878','#3E4989','#31688E','#26828E','#1F9E89','#35B779','#6DCD59','#B4DE2C','#FDE725'];
+  const colorFor = lvl => palette[lvl % palette.length];
+  const trunc = (s, n=24) => (s||'').length>n ? (s||'').slice(0,n-1)+'…' : (s||'');
 
-  const maxLevel = nodeLevels ? Math.max(...nodeLevels.values()) : 0;
-  output += `    // Maximum depth: ${maxLevel} levels\n`;
-
-  // Collect level-max nodes (terminal for downstream, base for upstream)
-  const extremeNodes = [];
-  if (nodeLevels) {
-    for (const [n, lvl] of nodeLevels.entries()) if (lvl === maxLevel) extremeNodes.push(n);
-    const extremeLabel = isDown ? 'Terminal nodes' : 'Base models';
-    output += `    // ${extremeLabel}: ${extremeNodes.join(', ')}\n\n`;
-  }
-
-  // Paths section changes wording
-  if (nodePaths && extremeNodes.length) {
-    const pathLabel = isDown ? 'Paths to terminal nodes' : 'Paths to base models';
-    output += `    // ${pathLabel}:\n`;
-    extremeNodes.forEach(nodeId => {
-      const p = nodePaths.get(nodeId);
-      if (p) output += `    // ${nodeId}: ${p.join(' -> ')} (${p.length - 1} steps)\n`;
-    });
-    output += '\n';
-  }
-
-  // Level groups
-  if (nodeLevels) {
-    const levelGroups = {};
-    for (const [n, lvl] of nodeLevels.entries()) {
-      (levelGroups[lvl] = levelGroups[lvl] || []).push(n);
+  // Add nodes in chunks
+  for (const [lvl, arr] of levels.entries()) {
+    let i = 0; const span = Math.max(1, arr.length - 1);
+    while (i < arr.length) {
+      const end = Math.min(i + 2000, arr.length);
+      for (; i < end; i++) {
+        const nd = arr[i];
+        const x = (arr.length===1) ? (leftPad + (width-leftPad-rightPad)/2) : leftPad + (i/span)*(width-leftPad-rightPad);
+        const y = yFor(lvl);
+        if (!graph.hasNode(nd.id)) graph.addNode(nd.id, {
+          x, y,
+          size: nd.isExtreme ? 6.5 : 5,
+          label: trunc(nd.display || nd.id), // enable zoomed labels
+          color: colorFor(lvl),
+          level: lvl
+        });
+      }
+      await new Promise(r=>setTimeout(r,0));
     }
-    for (let l = 0; l <= maxLevel; l++) {
-      if (levelGroups[l]) {
-        output += `    // Level ${l} (${levelGroups[l].length} nodes)\n`;
-        output += `    { rank=same; `;
-        levelGroups[l].forEach(n => output += `"${n}"; `);
-        output += `}\n`;
+  }
+
+  // Edges in chunks
+  let ei = 0;
+  while (ei < edges.length) {
+    const end = Math.min(ei + 4000, edges.length);
+    for (; ei < end; ei++) {
+      const e = edges[ei];
+      const from = e.source || e.from;
+      const to   = e.target || e.to;
+      if (from === to) continue; // skip self-loop
+      if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from, to)) {
+        try { graph.addEdge(from, to, { size: 1 }); } catch {}
       }
     }
-    output += '\n';
+    await new Promise(r=>setTimeout(r,0));
   }
 
-  // Nodes
-  const levelColors = ['red', 'orange', 'yellow', 'lightgreen', 'lightblue', 'lightpink', 'lavender', 'lightcyan', 'lightgray'];
-  order.forEach(node => {
-    const level = nodeLevels ? nodeLevels.get(node) : 0;
-    const color = levelColors[level % levelColors.length];
-    const modelName = getModelNameForNode(node);
-    const displayLabel = modelName || node;
-    const path = nodePaths ? nodePaths.get(node) : null;
-    const pathLength = path ? path.length - 1 : 0;
-    const isExtreme = level === maxLevel; // terminal (downstream) or base (upstream)
-    const marker = isDown ? '[TERMINAL]' : '[BASE]';
-
-    let nodeLabel = `${displayLabel}\\nLevel: ${level}`;
-    if (pathLength > 0) nodeLabel += `\\nSteps: ${pathLength}`;
-    if (isExtreme) nodeLabel += `\\n${marker}`;
-
-    const nodeStyle = isExtreme ? `, style="filled,bold", penwidth=3` : '';
-    output += `    "${node}" [fillcolor=${color}, label="${nodeLabel}"${nodeStyle}];\n`;
+  // Sigma renderer with label threshold (labels only when zoomed in)
+  container.innerHTML = '';
+  __sigmaRenderer = new SigmaCtor(graph, container, {
+    renderLabels: true,
+    labelRenderedSizeThreshold: 12,  // must be big on screen to draw label
+    enableEdgeHoverEvents: true
   });
 
-  // Edges
-  output += '\n    // Edges with level labels\n';
-  const uniq = new Set();
-  edges.forEach(e => {
-    const key = `${e.from}->${e.to}`;
-    if (!uniq.has(key)) {
-      uniq.add(key);
-      const edgeLevel = (e.level !== undefined) ? ` [label="L${e.level}"]` : '';
-      output += `    "${e.from}" -> "${e.to}"${edgeLevel};\n`;
-    }
+  // Hover tooltip (HTML overlay)
+  const tip = document.createElement('div');
+  tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
+  container.appendChild(tip);
+
+  __sigmaRenderer.on('enterNode', ({ node }) => {
+    const attrs = graph.getNodeAttributes(node);
+    tip.textContent = `${attrs.label || node} (Level ${attrs.level || 0})`;
+    tip.style.display = 'block';
+  });
+  __sigmaRenderer.on('leaveNode', () => {
+    tip.style.display = 'none';
+  });
+  __sigmaRenderer.getMouseCaptor().on('mousemoveBody', (e) => {
+    // position near cursor inside container
+    const rect = container.getBoundingClientRect();
+    tip.style.left = (e.x - rect.left + 12) + 'px';
+    tip.style.top  = (e.y - rect.top  - 10) + 'px';
   });
 
-  output += '}';
-  return output;
+  // Controls & legend overlay (like D3)
+  const helper = document.createElement('div');
+  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
+  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  container.appendChild(helper);
 }
 
-function getModelNameForNode(nodeId) {
-  // Try pre-parsed label map first (fastest)
-  if (window.nodeLabelsGlobal && window.nodeLabelsGlobal[nodeId]) return window.nodeLabelsGlobal[nodeId];
+async function renderWithSigmaFastFromDot(dotContent, container) {
+  await loadScriptOnce('https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js', () => !!window.graphology);
+  await loadScriptOnce('https://unpkg.com/sigma@2.4.0/build/sigma.min.js', () => !!window.Sigma || !!window.sigma);
+  const Graph = window.graphology?.Graph; const SigmaCtor = window.Sigma || window.sigma; if (!Graph || !SigmaCtor) throw new Error('Sigma/Graphology failed to load.');
+  const { nodes, edges } = parseNodesEdgesFromDot(dotContent); const graph = new Graph({ multi:false, allowSelfLoops:false });
 
-  // Fallback: scan DOT lines (escape id for regex safety)
-  const escaped = String(nodeId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  for (let line of (dotFileLines || [])) {
-    const m = line.match(new RegExp(`^\\s*"?${escaped}"?\\s*\\[.*label="([^"]+)".*\\]`));
-    if (m) return m[1];
+  const rect = container.getBoundingClientRect(); const width = rect.width || 1200; const height = Math.max(700, rect.height || 700);
+  const levels = new Map(); let maxLevel = 0; nodes.forEach(n => { const l = n.level||0; maxLevel=Math.max(maxLevel,l); (levels.get(l) || levels.set(l, []).get(l)).push?.(n) || levels.get(l).push(n); });
+  const topPad=80, bottomPad=60, leftPad=80, rightPad=60; const rows=Math.max(1,maxLevel+1);
+  const levelGap=Math.max(90,(height-topPad-bottomPad)/rows); const rowY = l => topPad + l*levelGap;
+  const palette = ['#440154','#482878','#3E4989','#31688E','#26828E','#1F9E89','#35B779','#6DCD59','#B4DE2C','#FDE725'];
+  const colorFor = lvl => palette[lvl % palette.length];
+  const trunc = (s, n=24) => (s||'').length>n ? (s||'').slice(0,n-1)+'…' : (s||'');
+
+  for (const [lvl, arr] of levels.entries()) {
+    let i = 0; const span = Math.max(1, arr.length - 1);
+    while (i < arr.length) {
+      const end = Math.min(i + 2000, arr.length);
+      for (; i < end; i++) {
+        const nd = arr[i];
+        const x = (arr.length===1) ? (leftPad + (width-leftPad-rightPad)/2) : leftPad + (i/span)*(width-leftPad-rightPad);
+        const y = rowY(lvl);
+        if (!graph.hasNode(nd.id)) graph.addNode(nd.id, { x, y, size: nd.isExtreme?6.5:5, label: trunc(nd.display || nd.id), color: colorFor(lvl), level: lvl });
+      }
+      await new Promise(r=>setTimeout(r,0));
+    }
+  }
+  let ei = 0;
+  while (ei < edges.length) {
+    const end = Math.min(ei + 4000, edges.length);
+    for (; ei < end; ei++) {
+      const e = edges[ei]; const from = e.source || e.from; const to = e.target || e.to;
+      if (from === to) continue;
+      if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from,to)) {
+        try { graph.addEdge(from,to,{ size:1 }); } catch {}
+      }
+    }
+    await new Promise(r=>setTimeout(r,0));
   }
 
-  // Extra fallback for zero-padded numeric ids appearing only in edges
-  const nodeIdStr = nodeId.toString();
-  for (let line of (dotFileLines || [])) {
-    const padded = nodeIdStr.padStart(7, '0');
-    if (line.includes(`"${padded}"`)) {
-      const match = line.match(/"0*(\d+)"\s*->\s*"0*(\d+)"/);
-      if (match) {
-        const fromId = match[1].replace(/^0+/, '') || '0';
-        const toId   = match[2].replace(/^0+/, '') || '0';
-        if (window.nodeLabelsGlobal) {
-          if (fromId === nodeIdStr && window.nodeLabelsGlobal[fromId]) return window.nodeLabelsGlobal[fromId];
-          if (toId   === nodeIdStr && window.nodeLabelsGlobal[toId])   return window.nodeLabelsGlobal[toId];
+  container.innerHTML = '';
+  __sigmaRenderer = new SigmaCtor(graph, container, {
+    renderLabels: true,
+    labelRenderedSizeThreshold: 12,
+    enableEdgeHoverEvents: true
+  });
+
+  // Hover tooltip + overlay
+  const tip = document.createElement('div');
+  tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
+  container.appendChild(tip);
+  __sigmaRenderer.on('enterNode', ({ node }) => {
+    const attrs = graph.getNodeAttributes(node);
+    tip.textContent = `${attrs.label || node} (Level ${attrs.level || 0})`;
+    tip.style.display = 'block';
+  });
+  __sigmaRenderer.on('leaveNode', () => { tip.style.display = 'none'; });
+  __sigmaRenderer.getMouseCaptor().on('mousemoveBody', (e) => {
+    const rect = container.getBoundingClientRect();
+    tip.style.left = (e.x - rect.left + 12) + 'px';
+    tip.style.top  = (e.y - rect.top  - 10) + 'px';
+  });
+
+  const helper = document.createElement('div');
+  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
+  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  container.appendChild(helper);
+}
+
+/* =========================
+   DOT helpers + UI helpers
+   ========================= */
+const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
+
+function showStatus(message, type) {
+  const el = document.getElementById('status');
+  el.textContent = message;
+  el.className = `status ${type||''}`;
+  el.style.display = message ? 'block' : 'none';
+}
+function clearResults(){
+  const c = document.getElementById('graphviz-container');
+  c.innerHTML = '<div style="text-align:center; padding:50px; color:#666;">Enter a model and run traversal</div>';
+  const out = document.getElementById('dotOutput'); if (out) out.value='';
+  showStatus('Results cleared', 'success');
+}
+function showGraphStats(){
+  const nodeCount = Object.keys(window.fullGraph||{}).length;
+  const revCount = Object.keys(window.reverseGraph||{}).length;
+  const edgeCount = Object.values(window.fullGraph||{}).reduce((s,n)=>s+(n?.length||0),0);
+  alert(`Forward nodes: ${nodeCount}\nReverse nodes: ${revCount}\nEdges: ${edgeCount}`);
+}
+function copyDotFormat(){
+  const ta = document.getElementById('dotOutput'); if (!ta || !ta.value) return showStatus('No content to copy', 'error');
+  ta.select(); document.execCommand('copy'); showStatus('DOT copied to clipboard', 'success');
+}
+function downloadDotFile(){
+  const text = document.getElementById('dotOutput')?.value || '';
+  if (!text) return showStatus('No traversal results to download', 'error');
+  const modelSafe = (document.getElementById('startNode')?.value || 'model').trim().replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,'_');
+  const algo = document.getElementById('algorithm')?.value;
+  const filename = (algo==='DFS') ? `Forward_analysis_of_${modelSafe}.dot` : `Backward_analysis_of_${modelSafe}.dot`;
+  const blob = new Blob([text], { type:'text/plain' });
+  const link = document.createElement('a'); link.download = filename; link.href = window.URL.createObjectURL(blob); link.click();
+  window.URL.revokeObjectURL(link.href); showStatus(`Saved: ${filename}`, 'success');
+}
+window.clearResults = clearResults;
+window.showGraphStats = showGraphStats;
+window.copyDotFormat = copyDotFormat;
+window.downloadDotFile = downloadDotFile;
+
+/* =========================
+   UTIL: loadScriptOnce
+   ========================= */
+function loadScriptOnce(src, checkFn){
+  return new Promise((resolve, reject) => {
+    try{
+      if (typeof checkFn === 'function' && checkFn()) return resolve();
+      const existing = Array.from(document.querySelectorAll('script')).find(s => s.src === src);
+      if (existing) {
+        if (typeof checkFn !== 'function') return resolve();
+        const iv = setInterval(() => { if (checkFn()) { clearInterval(iv); resolve(); } }, 50);
+        setTimeout(() => { clearInterval(iv); resolve(); }, 4000);
+        return;
+      }
+      const s = document.createElement('script'); s.src = src; s.async = true;
+      s.onload = () => (typeof checkFn === 'function'
+          ? (checkFn() ? resolve() : setTimeout(() => checkFn() ? resolve() : reject(new Error(`Script loaded but check failed: ${src}`)), 50))
+          : resolve());
+      s.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+      document.head.appendChild(s);
+    }catch(e){reject(e);}
+  });
+}
+
+/* =========================
+   WORKER SOURCE (as string)
+   ========================= */
+const WORKER_SOURCE = `
+  const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
+  const quoteId = (s) => \`"\${String(s).replace(/"/g, '\\\\\\"')}"\`;
+  const escLbl  = (s) => String(s).replace(/"/g, '\\\\\\"');
+
+  self.onmessage = async (ev) => {
+    const msg = ev.data || {};
+    if (msg.type !== 'traverse') return;
+    const { runId, filePath, startNode, direction, algorithm, maxDepth } = msg;
+    try {
+      postMessage({ type: 'progress', phase: 'fetch', runId });
+      const res = await fetch(filePath);
+      if (!res.ok) throw new Error(\`Failed to load \${filePath}: \${res.status}\`);
+
+      // Stream + parse DOT
+      const { fullGraph, reverseGraph, labels, lines } = await parseDotStream(res.body);
+      postMessage({ type: 'progress', phase: 'traverse', runId, algorithm });
+
+      // Resolve start
+      const graph = (direction === 'upstream') ? reverseGraph : fullGraph;
+      const actualStart = resolveStartNode(graph, startNode);
+      if (!actualStart) throw new Error(\`Start node "\${startNode}" not found\`);
+
+      // Traverse
+      const T = (algorithm === 'DFS')
+        ? traverseDFS(graph, actualStart, maxDepth, direction)
+        : traverseBFS(graph, actualStart, maxDepth, direction);
+
+      const maxLevel = Math.max(...T.levels.values());
+      const nodes = T.order.map(id => ({
+        id,
+        display: labels[id] || id,
+        level: T.levels.get(id) || 0,
+        isExtreme: (T.levels.get(id) || 0) === maxLevel
+      }));
+      const edges = dedupeEdges(T.edges).map(e => ({ source: e.from, target: e.to }));
+
+      // Build paths only for extremes (for DOT comments)
+      const extremes = []; for (const [n,l] of T.levels.entries()) if (l===maxLevel) extremes.push(n);
+      const paths = buildPathsFor(extremes, T.parent);
+
+      postMessage({ type: 'progress', phase: 'prep', runId });
+
+      const dot = generateTraversalDot(T.order, T.edges, algorithm, actualStart, direction, T.levels, paths, labels);
+
+      postMessage({
+        type: 'result', runId,
+        direction, maxLevel, nodes, edges,
+        dot, labels, dotLines: lines,
+        fullGraph, reverseGraph
+      });
+    } catch (e) {
+      postMessage({ type: 'error', runId, message: e.message || String(e) });
+    }
+  };
+
+  function resolveStartNode(graphObj, userInput) {
+    if (!userInput) return null; if (graphObj[userInput]) return userInput;
+    const q = userInput.toLowerCase();
+    const keys = Object.keys(graphObj);
+    let found = keys.find(k => k.toLowerCase() === q) ||
+                keys.find(k => k.toLowerCase().startsWith(q)) ||
+                keys.find(k => k.toLowerCase().includes(q));
+    if (found) return found;
+    for (const tgts of Object.values(graphObj)) {
+      if (tgts.includes(userInput)) { if (!graphObj[userInput]) graphObj[userInput] = []; return userInput; }
+    }
+    return null;
+  }
+
+  // Streaming DOT parser (line-by-line) – with self-loop filtering
+  async function parseDotStream(readable) {
+    const dec = new TextDecoder();
+    const full = {}, rev = {}, labels = {};
+    const lines = [];
+    let buf = '';
+    let lineCount = 0;
+
+    if (!readable) {
+      return { fullGraph: full, reverseGraph: rev, labels, lines: [] };
+    }
+
+    const reader = readable.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buf.indexOf('\\n')) >= 0) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        lines.push(raw);
+        processDotLine(raw, full, rev, labels);
+        if ((++lineCount % 4000) === 0) postMessage({ type: 'progress', phase: 'parse', lines: lineCount });
+      }
+    }
+    if (buf) { lines.push(buf); processDotLine(buf, full, rev, labels); }
+    return { fullGraph: full, reverseGraph: rev, labels, lines };
+  }
+
+  function processDotLine(raw, full, rev, labels) {
+    const line = raw.trim();
+    if (!line || line === '{' || line === '}' || /^\\/\\//.test(line) || /^#/.test(line)) return;
+    if (/(^|\\s)(digraph|graph)(\\s|\\{)/.test(line)) return;
+
+    let m = line.match(/^"([^"]+)"\\s*\\[.*\\blabel="([^"]*)".*\\]/) ||
+            line.match(/^([\\w./-]+)\\s*\\[.*\\blabel="([^"]*)".*\\]/);
+    if (m) {
+      const id = unquote(m[1]); const label = m[2];
+      if (labels[id] === undefined) labels[id] = label;
+      (full[id] ||= []); (rev[id] ||= []);
+      return;
+    }
+    m = line.match(/"([^"]+)"\\s*->\\s*"([^"]+)"/) || line.match(/([\\w./-]+)\\s*->\\s*([\\w./-]+)/);
+    if (m) {
+      const from = unquote(m[1]); const to = unquote(m[2]);
+      if (from === to) return; // skip self-loop
+      (full[from] ||= []).push(to); (full[to] ||= []);
+      (rev[to]   ||= []).push(from); (rev[from] ||= []);
+    }
+  }
+
+  // Traversals with self-loop guard
+  function traverseDFS(graphObj, start, maxDepth, direction) {
+    const stack = [[start, 0]];
+    const visited = new Set();
+    const order = [];
+    const edges = [];
+    const levels = new Map([[start, 0]]);
+    const parent = new Map();
+
+    while (stack.length) {
+      const [node, depth] = stack.pop();
+      if (visited.has(node)) continue;
+      visited.add(node);
+      order.push(node);
+
+      const neighbors = graphObj[node] || [];
+      for (let i = neighbors.length - 1; i >= 0; i--) {
+        const nb = neighbors[i];
+        if (nb === node) continue;  // self-loop guard
+        const edge = direction==='upstream' ? {from:nb,to:node,level:depth+1} : {from:node,to:nb,level:depth+1};
+        edges.push(edge);
+        if (!visited.has(nb) && depth + 1 <= maxDepth) {
+          if (!levels.has(nb)) levels.set(nb, depth + 1);
+          if (!parent.has(nb)) parent.set(nb, node);
+          stack.push([nb, depth + 1]);
         }
       }
     }
+    return { order, edges, levels, parent };
   }
-  return null;
-}
+
+  function traverseBFS(graphObj, start, maxDepth, direction) {
+    const queue = [[start, 0]];
+    let qi = 0;
+    const visited = new Set([start]);
+    const order = [];
+    const edges = [];
+    const levels = new Map([[start, 0]]);
+    const parent = new Map();
+
+    while (qi < queue.length) {
+      const [node, depth] = queue[qi++];
+      order.push(node);
+      const neighbors = graphObj[node] || [];
+      for (const nb of neighbors) {
+        if (nb === node) continue; // self-loop guard
+        const edge = direction==='upstream' ? {from:nb,to:node,level:depth+1} : {from:node,to:nb,level:depth+1};
+        edges.push(edge);
+        if (!visited.has(nb) && depth + 1 <= maxDepth) {
+          visited.add(nb);
+          levels.set(nb, depth + 1);
+          if (!parent.has(nb)) parent.set(nb, node);
+          queue.push([nb, depth + 1]);
+        }
+      }
+    }
+    return { order, edges, levels, parent };
+  }
+
+  function buildPathsFor(nodesSet, parentMap) {
+    const out = new Map();
+    for (const n of nodesSet) {
+      const p = []; let cur = n;
+      while (cur !== undefined) { p.unshift(cur); cur = parentMap.get(cur); }
+      out.set(n, p);
+    }
+    return out;
+  }
+
+  function dedupeEdges(edges) {
+    const seen = new Set(), out = [];
+    for (const e of edges) {
+      if (e.from === e.to) continue; // self-loop guard
+      const key = \`\${e.from}->\${e.to}\`;
+      if (seen.has(key)) continue;
+      seen.add(key); out.push(e);
+    }
+    return out;
+  }
+
+  function generateTraversalDot(order, edges, algorithm, startNode, direction, nodeLevels, nodePaths, labels) {
+    const isDown = direction === 'downstream';
+    const sanitize = s => (s || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const graphTitle = isDown ? \`Forward_Subgraph_Analysis_of_\${sanitize(startNode)}\` : \`Backward_Subgraph_Analysis_of_\${sanitize(startNode)}\`;
+    const out = [];
+    out.push(\`digraph "\${graphTitle}" {\`);
+    out.push(\`  node [shape=box, style=filled];\`);
+    out.push(\`  edge [color=blue];\`);
+    out.push('');
+    out.push(\`  // Nodes visited: \${order.length}\`);
+    out.push(\`  // Edges found: \${edges.length}\`);
+    const maxLevel = nodeLevels ? Math.max(...nodeLevels.values()) : 0; out.push(\`  // Maximum depth: \${maxLevel} levels\`);
+    const extremeNodes = []; if (nodeLevels) for (const [n,l] of nodeLevels.entries()) if (l===maxLevel) extremeNodes.push(n);
+    if (extremeNodes.length) out.push(\`  // \${isDown ? 'Terminal nodes' : 'Base models'}: \${extremeNodes.join(', ')}\`);
+    out.push('');
+    if (nodePaths && extremeNodes.length) {
+      out.push(\`  // \${isDown ? 'Paths to terminal nodes' : 'Paths to base models'}:\`);
+      extremeNodes.forEach(n => { const p = nodePaths.get(n); if (p) out.push(\`  // \${n}: \${p.join(' -> ')} (\${p.length - 1} steps)\`); });
+      out.push('');
+    }
+    if (nodeLevels) { const groups = {}; for (const [n,l] of nodeLevels.entries()) (groups[l] ||= []).push(n); for (let l=0;l<=maxLevel;l++){ if (groups[l]?.length) out.push(\`  { rank=same; \${groups[l].map(n => quoteId(n)).join('; ')}; }\`); } out.push(''); }
+    const levelColors = ['red','orange','yellow','lightgreen','lightblue','lightpink','lavender','lightcyan','lightgray'];
+    for (const node of order) {
+      const level = nodeLevels?.get(node) ?? 0; const color = levelColors[level % levelColors.length];
+      const display = labels?.[node] || node;
+      const path = nodePaths?.get(node); const steps = path ? path.length - 1 : 0;
+      const isExtreme = level === maxLevel; const marker = isDown ? '[TERMINAL]' : '[BASE]';
+      const label = \`\${escLbl(display)}\\\\nLevel: \${level}\${steps ? \`\\\\nSteps: \${steps}\` : ''}\${isExtreme ? \`\\\\n\${marker}\` : ''}\`;
+      const nodeStyle = isExtreme ? \`, style="filled,bold", penwidth=3\` : '';
+      out.push(\`  \${quoteId(node)} [fillcolor=\${color}, label="\${label}"\${nodeStyle}];\`);
+    }
+    out.push('');
+    out.push(\`  // Edges with level labels\`);
+    const seen = new Set();
+    for (const e of edges) {
+      if (e.from === e.to) continue; // self-loop guard
+      const key = \`\${e.from}->\${e.to}\`; if (seen.has(key)) continue; seen.add(key);
+      const edgeLevel = (e.level !== undefined) ? \` [label="L\${e.level}"]\` : '';
+      out.push(\`  \${quoteId(e.from)} -> \${quoteId(e.to)}\${edgeLevel};\`);
+    }
+    out.push('}');
+    return out.join('\\n');
+  }
+`;
+
+/* =========================
+   END worker source string
+   ========================= */
