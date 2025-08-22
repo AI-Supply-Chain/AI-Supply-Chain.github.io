@@ -1,133 +1,131 @@
-/* ==========================
-   AI Supply Chain – App CSS
-   ========================== */
-
 :root{
   --container-max: 1400px;
   --gap: 20px;
   --radius: 8px;
   --border: 1px solid #ddd;
-  --brand: #007bff;
-  --brand-dark: #0056b3;
+  --brand: #0d6efd;
+  --brand-dark: #0b5ed7;
   --muted: #6c757d;
   --muted-dark:#545b62;
-  --pane-h: clamp(320px, 52vh, 640px);
+  --pane-h: clamp(360px, 56vh, 820px);
 }
 
-/* Reset */
-*{ box-sizing: border-box; }
-
-/* Base */
+/* Reset / base */
+*{ box-sizing:border-box; }
+html, body{ margin:0; padding:0; }
 body{
-  font-family: Arial, Helvetica, sans-serif;
-  margin: 0;
-  padding: 0;
-  background: #f4f4f4;
-  color: #111;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: #f5f6f7;
+  color:#111;
 }
 
+/* Container */
 .container{
-  padding: 20px;
   max-width: var(--container-max);
-  margin: 0 auto;
+  margin: 18px auto;
   background: #fff;
   border-radius: var(--radius);
-  box-shadow: 0 0 10px rgba(0,0,0,.08);
+  box-shadow: 0 5px 24px rgba(0,0,0,.06);
+  padding: 22px;
 }
 
-.header{ text-align: center; padding-bottom: 20px; }
-.header h1{ margin: 0 0 6px; font-size: 28px; }
-.header p{ margin: 0; color:#555; }
+/* Header */
+.header{ text-align:center; padding-bottom:10px; }
+.header h1{ margin:0 0 4px; font-weight:700; font-size:28px; }
+.header p{ margin:0; color:#4e5968; }
 
-/* File path callout */
+/* Callout */
 .file-path-section{
   background:#f8f9fa;
-  padding:15px;
-  border-radius:5px;
-  margin-bottom:20px;
+  padding:14px;
+  border-radius:6px;
   border-left:4px solid var(--brand);
+  margin:18px 0;
 }
 
-/* Layout grids */
-.input-section, .output-section{ margin-bottom: 30px; }
+/* Inputs layout */
+.input-section, .output-section{ margin:20px 0 10px; }
+.grid{ display:grid; grid-template-columns:1fr 1fr; gap:var(--gap); }
+.span-2{ grid-column:1 / -1; }
 
-.grid{
-  display: grid;
-  grid-template-columns: 1fr 1fr;  /* two columns */
-  gap: var(--gap);
-}
-
-/* Full-width helper */
-.input-section .grid .span-2{ grid-column: 1 / -1; }
-
-.input-group{ margin-bottom: 8px; }
-label{ display:block; margin:0 0 6px; font-weight:700; }
-
+.input-group label{ display:block; font-weight:700; margin:0 0 6px; }
 input, select, textarea{
-  width: 100%;
-  padding: 10px;
+  width:100%;
+  padding:10px;
   border: var(--border);
-  border-radius: 4px;
-  background: #fff;
+  border-radius:6px;
+  background:#fff;
+}
+input:focus, select:focus, textarea:focus{
+  outline: 2px solid rgba(13,110,253,.35);
+  outline-offset: 2px;
 }
 
-/* Make dropdown (select) match input width and keep Search button to the right */
-.select-row{
-  display: grid;
-  grid-template-columns: 1fr auto; /* full-width select + fixed button */
-  gap: 10px;
-}
-#startNodeSelect{ width: 100% !important; }  /* ensure same length as input */
+.select-row{ display:grid; grid-template-columns:1fr auto; gap:10px; }
 
 /* Buttons */
-.button-group{ display:flex; gap:10px; flex-wrap:wrap; }
+.button-group{ display:flex; flex-wrap:wrap; gap:10px; margin-top:8px; }
 .button-group button{
-  padding:12px 20px;
   cursor:pointer;
   border:none;
-  border-radius:4px;
-  background:var(--brand);
+  border-radius:6px;
   color:#fff;
-  font-size:14px;
+  padding:11px 16px;
+  font-weight:600;
+  background: var(--brand);
 }
-.button-group button:hover{ background:var(--brand-dark); }
-.button-group .secondary{ background:var(--muted); }
-.button-group .secondary:hover{ background:var(--muted-dark); }
+.button-group button:hover{ background: var(--brand-dark); }
+.button-group .secondary{ background: var(--muted); }
+.button-group .secondary:hover{ background: var(--muted-dark); }
+.button-group button:focus-visible{
+  outline: 3px solid rgba(13,110,253,.35);
+  outline-offset: 2px;
+}
 
-/* Status toasts */
-.status{ margin:10px 0; padding:10px; border-radius:4px; background:#e9ecef; }
+/* Status */
+.status{ display:none; margin:12px 0; padding:10px; border-radius:6px; background:#e9ecef; color:#111; }
 .status.success{ background:#d4edda; color:#155724; }
 .status.error{ background:#f8d7da; color:#721c24; }
 
-/* Output split */
-.output-section .grid{ align-items: start; }
+/* Output */
+.output-section .grid{ align-items:start; }
 
 #graphviz-container{
   height: var(--pane-h);
-  min-height: 0 !important;
+  position:relative;
+  background:#fff;
   border: var(--border);
-  border-radius: 4px;
-  background: #fff;
-  padding: 10px;
-  overflow: auto;
-  position: relative;
+  border-radius:6px;
+  padding:10px;
+  overflow:auto;
 }
 #graphviz-container svg{ max-width:100%; height:auto; }
 
-.dot-textarea{
-  height: var(--pane-h);
-  resize: vertical;
-  font-family: "Courier New", monospace;
-  font-size: 12px;
-  border: var(--border);
-  border-radius: 4px;
-  padding: 10px;
+/* Hide UI while keeping elements in the DOM for JS to use */
+.hidden-ui { display: none !important; }
+/* .hidden-ui { display: none !important; } */
+
+/* Subtle helper note under inputs */
+.helper-note{
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: #4e5968;
 }
 
-.output-section h2{ margin:0 0 8px; font-size:18px; }
+
+.dot-textarea{
+  height: var(--pane-h);
+  resize:vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
+  font-size:12px;
+  border: var(--border);
+  border-radius:6px;
+  padding:10px;
+}
+
+.hint{ color:#666; font-size:12px; }
 
 /* Responsive */
 @media (max-width: 900px){
-  .grid{ grid-template-columns: 1fr; }
-  :root{ --pane-h: 360px; }
+  .grid{ grid-template-columns:1fr; }
 }

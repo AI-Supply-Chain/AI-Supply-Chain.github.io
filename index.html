@@ -2,48 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AI Supply Chain Graph Visualization and Analysis </title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Supply Chain Graph Visualization and Analysis</title>
 
-  <!-- Optional: your site stylesheet -->
+  <!-- Site stylesheet -->
   <link rel="stylesheet" href="css/styles.css" />
-  <style>
-    :root{ --container-max:1400px; --gap:20px; --radius:8px; --border:1px solid #ddd; --brand:#0d6efd; --brand-dark:#0b5ed7; --muted:#6c757d; --muted-dark:#545b62; --pane-h:clamp(360px,56vh,820px);}
-    *{box-sizing:border-box}
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f5f6f7;color:#111}
-    .container{max-width:var(--container-max);margin:18px auto;background:#fff;border-radius:var(--radius);box-shadow:0 5px 24px rgba(0,0,0,.06);padding:22px}
-    .header{text-align:center;padding-bottom:10px}
-    .header h1{margin:0 0 4px;font-weight:700;font-size:28px}
-    .header p{margin:0;color:#4e5968}
-    .file-path-section{background:#f8f9fa;padding:14px;border-radius:6px;border-left:4px solid var(--brand);margin:18px 0}
-    .input-section,.output-section{margin:20px 0 10px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--gap)}
-    .span-2{grid-column:1 / -1}
-    .input-group label{display:block;font-weight:700;margin:0 0 6px}
-    input,select,textarea{width:100%;padding:10px;border:var(--border);border-radius:6px;background:#fff}
-    .select-row{display:grid;grid-template-columns:1fr auto;gap:10px}
-    .button-group{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
-    .button-group button{cursor:pointer;border:none;border-radius:6px;color:#fff;padding:11px 16px;font-weight:600;background:var(--brand)}
-    .button-group button:hover{background:var(--brand-dark)}
-    .button-group .secondary{background:var(--muted)}
-    .button-group .secondary:hover{background:var(--muted-dark)}
-    #status{display:none;margin:12px 0;padding:10px;border-radius:6px;background:#e9ecef;color:#111}
-    #status.success{background:#d4edda;color:#155724}
-    #status.error{background:#f8d7da;color:#721c24}
-    .output-section .grid{align-items:start}
-    #graphviz-container{height:var(--pane-h);position:relative;background:#fff;border:var(--border);border-radius:6px;padding:10px;overflow:auto}
-    #graphviz-container svg{max-width:100%;height:auto}
-    .dot-textarea{height:var(--pane-h);resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,"Courier New",monospace;font-size:12px;border:var(--border);border-radius:6px;padding:10px}
-    .hint{color:#666;font-size:12px}
-    @media (max-width: 900px){.grid{grid-template-columns:1fr}}
-  </style>
 </head>
 <body>
   <div class="container">
     <!-- HEADER -->
     <div class="header">
-      <h1>AI Supply Chain Graph Visualization and Analysis</h1>
-      <p>HuggingGraph: Understanding the Supply Chain of LLM Ecosystem</p>
+      <h1>AI Supply Chain Graph Analysis</h1>
+      <!-- <p>HuggingGraph: Understanding the Supply Chain of LLM Ecosystem</p> -->
     </div>
 
     <!-- FILE PATH CONFIG -->
@@ -51,7 +21,7 @@
       <div class="input-group">
         <label for="filePath">📁 Graph File Path</label>
         <input type="text" id="filePath" placeholder="Path to the .dot file" value="AI-Supply-Chain-Graph.dot" />
-        <small class="hint">Point this to your actual DOT file.</small>
+        <small class="hint">Point this to your actual DOT file (served from the same origin).</small>
       </div>
     </div>
 
@@ -59,13 +29,23 @@
     <div class="input-section">
       <div class="grid">
         <div class="input-group">
-          <label for="algorithm">Select a type of Graph Analysis</label>
+          <label for="algorithm">Direction of Traversal</label>
           <select id="algorithm">
-            <option value="DFS">Forward Graph Analysis</option>
-            <option value="BFS">Backward Graph Analysis</option>
+            <option value="DFS">⬇️ Forward/Downstream Graph Analysis</option> 
+            <option value="BFS">⬆️ Backward/Upstream Graph Analysis</option> ⬆️
           </select>
         </div>
-        <div class="input-group">
+
+        <!-- <div class="input-group">
+          <label for="direction">Select a Direction</label>
+          <select id="direction">
+            <option value="downstream">⬇️ Downstream</option>
+            <option value="upstream">⬆️ Upstream</option>
+          </select>
+        </div> -->
+
+        <!-- Direction (hidden, still in DOM) -->
+        <div class="input-group hidden-ui" aria-hidden="true">
           <label for="direction">Select a Direction</label>
           <select id="direction">
             <option value="downstream">⬇️ Downstream</option>
@@ -73,27 +53,42 @@
           </select>
         </div>
 
+        <div class="input-group">
+          <label for="maxDepth">Desired Graph Level (1–50)</label>
+          <input type="number" id="maxDepth" value="5" min="1" max="50" />
+        </div>
+
         <div class="input-group span-2">
           <label for="startNodeTypeahead">Choose an AI model from the list</label>
+          <!-- <p>After Selecting an AI model please press Run Traversal to start the analysis.</p> -->
           <div class="select-row">
             <input id="startNodeTypeahead" list="modelOptions" placeholder="Type to search models (e.g., llama, yi, mistral)" />
             <datalist id="modelOptions"></datalist>
             <button type="button" class="secondary" onclick="useSelectedStartNode()">☑️ Select</button>
           </div>
-          <!-- <small class="hint">Reads <code>AI-SCG-Forward-Analysis.csv</code> (column <code>base_model</code>).</small> -->
+            <!-- New: subtle note placed AFTER the box -->
+            <p class="helper-note" role="note">
+              After selecting an AI model, press <strong>Run Traversal</strong> to start the analysis.
+            </p>
         </div>
 
-        <div class="input-group span-2">
+        <!-- <div class="input-group span-2">
+          <label for="startNode">Starting Model Name</label>
+          <input type="text" id="startNode" placeholder="Enter a model present in the graph" />
+        </div> -->
+
+        <!-- Starting Model Name (hidden, still in DOM) -->
+        <div class="input-group span-2 hidden-ui" aria-hidden="true">
           <label for="startNode">Starting Model Name</label>
           <input type="text" id="startNode" placeholder="Enter a model present in the graph" />
         </div>
 
-        <div class="input-group">
-          <label for="maxDepth">Desired Graph Depth Level (1–50)</label>
+        <!-- <div class="input-group">
+          <label for="maxDepth">Desired Graph Level (1–50)</label>
           <input type="number" id="maxDepth" value="5" min="1" max="50" />
-        </div>
+        </div> -->
 
-        <div class="input-group">
+        <!-- <div class="input-group">
           <label for="layout">Layout (Graphviz)</label>
           <select id="layout" disabled>
             <option value="dot">dot (hierarchical)</option>
@@ -102,7 +97,20 @@
             <option value="circo">circo</option>
             <option value="twopi">twopi</option>
           </select>
-          <!-- <small class="hint">Ignored: A2 force layout is used.</small> -->
+          <small class="hint">Disabled; we use D3 force layout and Sigma for performance.</small>
+        </div> -->
+
+        <!-- Layout (hidden, still in DOM) -->
+        <div class="input-group hidden-ui" aria-hidden="true">
+          <label for="layout">Layout (Graphviz)</label>
+          <select id="layout" disabled>
+            <option value="dot">dot (hierarchical)</option>
+            <option value="neato">neato</option>
+            <option value="fdp">fdp</option>
+            <option value="circo">circo</option>
+            <option value="twopi">twopi</option>
+          </select>
+          <small class="hint">Disabled; we use D3 force layout and Sigma for performance.</small>
         </div>
       </div>
     </div>
@@ -110,13 +118,13 @@
     <!-- ACTION BUTTONS -->
     <div class="button-group">
       <button onclick="performTraversal()">🚀 Run Traversal</button>
-      <button onclick="showGraphStats()" class="secondary">📊 Stats</button>
-      <button onclick="loadFullGraph()" class="secondary">📈 Full Graph</button>
+      <!-- <button onclick="showGraphStats()" class="secondary">📊 Stats</button> -->
+      <!-- <button onclick="loadFullGraph()" class="secondary">📈 Full Graph</button> -->
       <button onclick="clearResults()" class="secondary">🗑️ Clear</button>
     </div>
 
-    <!-- STATUS -->
-    <div id="status" class="status"></div>
+    <!-- STATUS (accessible) -->
+    <div id="status" class="status" role="status" aria-live="polite"></div>
 
     <!-- OUTPUT -->
     <div class="output-section">
@@ -139,10 +147,13 @@
     </div>
   </div>
 
-  <!-- LIBS -->
-  <script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
+  <!-- LIBS (defer so DOM is ready) -->
+  <script src="https://unpkg.com/d3@7/dist/d3.min.js" defer></script>
 
-  <!-- APP SCRIPT (contains traversal + A2 renderer; no ui.js needed) -->
-  <script src="js/graph-logic.js"></script>
+  <!-- UI helpers must load before main app -->
+  <script src="js/ui.js" defer></script>
+
+  <!-- APP SCRIPT (parser, traversal, renderers) -->
+  <script src="js/graph-logic.js" defer></script>
 </body>
 </html>
