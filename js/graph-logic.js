@@ -265,7 +265,8 @@ async function loadFullGraph() {
     const out = document.getElementById('dotOutput'); if (out) out.value = dotText;
     await renderGraph(dotText);
     showStatus('Full graph loaded successfully', 'success');
-  } catch (e) { console.error(e); showStatus('Error loading full graph: ' + e.message, 'error'); }
+    } catch (e) { console.error(e); showStatus('Error loading full graph: ' + e.message, 'error'); }
+
 }
 window.loadFullGraph = loadFullGraph;
 
@@ -496,13 +497,11 @@ function injectBottomLegendBar(container, redMeaning) {
 
   row2.append(depthLabel, grad, redNote);
 
-  // Put it all together
   foot.append(row1, row2);
   container.appendChild(foot);
 
   return () => { try { foot.remove(); } catch {} };
 }
-
 
 /* =========================
    D3 (SMALL GRAPHS)
@@ -533,11 +532,20 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
       .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#666');
   }
 
+  // prepare vertical positioning
+  const maxLevel = Math.max(0, ...nodes.map(d => d.level || 0));
+  const rowGap = 80;
+  const baseY = Math.max(120, height / 2 - (maxLevel * rowGap) / 2);
+  const levelToY = (lvl) =>
+    (window.lastDirection === 'upstream')
+      ? baseY + (maxLevel - (lvl || 0)) * rowGap // upstream: base on top, L0 bottom
+      : baseY + (lvl || 0) * rowGap;             // downstream: L0 top, terminals bottom
+
   const simulation = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(edges).id(d=>d.id).distance(95).strength(0.8))
     .force('charge', d3.forceManyBody().strength(-220))
     .force('center', d3.forceCenter(width/2, height/2))
-    .force('y', d3.forceY(d => (d.level||0) * 80 + height/2).strength(0.25));
+    .force('y', d3.forceY(d => levelToY(d.level)).strength(0.28));
 
   if (nodes.length <= 120) simulation.force('collision', d3.forceCollide().radius(16));
 
@@ -558,7 +566,6 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
         .text(d => (d.etypeAbbr || DEFAULT_EDGE_TYPE.abbr));
   }
 
-  const maxLevel = Math.max(0, ...nodes.map(d => d.level || 0));
   const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, maxLevel || 1]);
 
   const node = g.append('g').selectAll('circle').data(nodes).enter().append('circle')
@@ -666,10 +673,15 @@ async function renderWithSigmaLayered(nodes, edges, container) {
   const topPad=80, bottomPad=60, leftPad=80, rightPad=60;
   const rows = Math.max(1, maxLevel + 1);
   const levelGap=Math.max(90,(height-topPad-bottomPad)/rows);
-  const yFor = l => topPad + l*levelGap;
+
+  // flip rows for upstream so base models end up visually on top
+  const yFor = (lvl) =>
+    (window.lastDirection === 'upstream')
+      ? topPad + ( (rows - 1 - (lvl||0)) * levelGap )
+      : topPad + ( (lvl||0) * levelGap );
 
   const palette = ['#440154','#482878','#3E4989','#31688E','#26828E','#1F9E89','#35B779','#6DCD59','#B4DE2C','#FDE725'];
-  const colorFor = lvl => palette[lvl % palette.length];
+  const colorFor = lvl => palette[(lvl||0) % palette.length];
   const trunc = (s, n=24) => (s||'').length>n ? (s||'').slice(0,n-1)+'…' : (s||'');
 
   for (const [lvl, arr] of levels.entries()) {
@@ -704,7 +716,6 @@ async function renderWithSigmaLayered(nodes, edges, container) {
         try {
           graph.addEdge(from, to, {
             size: 1,
-            // important: expose label for Sigma to render
             label: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr,
             etype: e.etype || DEFAULT_EDGE_TYPE.type,
             etypeAbbr: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr
@@ -720,7 +731,6 @@ async function renderWithSigmaLayered(nodes, edges, container) {
     renderLabels: true,
     labelRenderedSizeThreshold: 12,
     enableEdgeHoverEvents: true,
-    // NEW: draw edge labels too
     renderEdgeLabels: true,
     edgeLabelRenderedSizeThreshold: 8
   });
@@ -770,9 +780,15 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
     levels.get(l).push(n);
   });
   const topPad=80, bottomPad=60, leftPad=80, rightPad=60; const rows=Math.max(1,maxLevel+1);
-  const levelGap=Math.max(90,(height-topPad-bottomPad)/rows); const rowY = l => topPad + l*levelGap;
+  const levelGap=Math.max(90,(height-topPad-bottomPad)/rows);
+
+  const rowY = (lvl) =>
+    (window.lastDirection === 'upstream')
+      ? topPad + (rows - 1 - (lvl||0)) * levelGap
+      : topPad + (lvl||0) * levelGap;
+
   const palette = ['#440154','#482878','#3E4989','#31688E','#26828E','#1F9E89','#35B779','#6DCD59','#B4DE2C','#FDE725'];
-  const colorFor = lvl => palette[lvl % palette.length];
+  const colorFor = lvl => palette[(lvl||0) % palette.length];
   const trunc = (s, n=24) => (s||'').length>n ? (s||'').slice(0,n-1)+'…' : (s||'');
 
   for (const [lvl, arr] of levels.entries()) {
@@ -798,7 +814,6 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
         try {
           graph.addEdge(from,to,{
             size:1,
-            // important: expose label for Sigma to render
             label: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr,
             etype: e.etype || DEFAULT_EDGE_TYPE.type,
             etypeAbbr: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr
@@ -814,7 +829,6 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
     renderLabels: true,
     labelRenderedSizeThreshold: 12,
     enableEdgeHoverEvents: true,
-    // NEW: draw edge labels too
     renderEdgeLabels: true,
     edgeLabelRenderedSizeThreshold: 8
   });
@@ -878,9 +892,9 @@ const WORKER_SOURCE = `
 
     var DEFAULT_EDGE_TYPE = { type: 'finetune', abbr: 'FT' };
 
-    function unquote(s){ return String(s).replace(/^(\"(.*)\")$/s, '$2'); }
-    function quoteId(s){ return '"' + String(s).replace(/"/g, '\\\\\\"') + '"'; }
-    function escLbl(s){  return String(s).replace(/"/g, '\\\\\\"'); }
+    function unquote(s){ return String(s).replace(/^(\\\"(.*)\\\")$/s, '$2'); }
+    function quoteId(s){ return '"' + String(s).replace(/"/g, '\\\\\\\\"') + '"'; }
+    function escLbl(s){  return String(s).replace(/"/g, '\\\\\\\\"'); }
 
     function normalizeEdgeType(raw) {
       if (!raw) return { type: DEFAULT_EDGE_TYPE.type, abbr: DEFAULT_EDGE_TYPE.abbr };
@@ -929,7 +943,7 @@ const WORKER_SOURCE = `
             };
           });
 
-          // --- FIX B: keep only edges whose endpoints are in the visited set ---
+          // keep only edges whose endpoints are in the visited set
           var keep = new Set(T.order);
           var edges = dedupeEdges(T.edges)
             .filter(function(e){ return keep.has(e.from) && keep.has(e.to); })
@@ -941,7 +955,6 @@ const WORKER_SOURCE = `
                 level: e.level
               };
             });
-          // --- END FIX B ---
 
           // Build paths only for extremes (for DOT comments)
           var extremes = [];
@@ -1069,11 +1082,11 @@ const WORKER_SOURCE = `
         for (var i = neighbors.length - 1; i >= 0; i--) {
           var nb = neighbors[i];
           if (nb === node) continue;
+          // Use the TRUE underlying edge key for type,
+          // but always VISUALIZE from current node -> neighbor.
           var key = (direction === 'upstream') ? (nb + '->' + node) : (node + '->' + nb);
           var norm = edgeTypes[key] || DEFAULT_EDGE_TYPE;
-          var edge = (direction === 'upstream')
-            ? {from: nb, to: node, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr}
-            : {from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr};
+          var edge = { from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr };
           edges.push(edge);
           if (!visited.has(nb) && depth + 1 <= maxDepth) {
             if (!levels.has(nb)) levels.set(nb, depth + 1);
@@ -1101,11 +1114,11 @@ const WORKER_SOURCE = `
         for (var i=0;i<neighbors.length;i++){
           var nb = neighbors[i];
           if (nb === node) continue;
+          // Use the TRUE underlying edge key for type,
+          // but always VISUALIZE from current node -> neighbor.
           var key = (direction === 'upstream') ? (nb + '->' + node) : (node + '->' + nb);
           var norm = edgeTypes[key] || DEFAULT_EDGE_TYPE;
-          var edge = (direction === 'upstream')
-            ? {from: nb, to: node, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr}
-            : {from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr};
+          var edge = { from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr };
           edges.push(edge);
           if (!visited.has(nb) && depth + 1 <= maxDepth) {
             visited.add(nb);
@@ -1147,6 +1160,8 @@ const WORKER_SOURCE = `
       var graphTitle = isDown ? ('Forward_Subgraph_Analysis_of_' + sanitize(startNode)) : ('Backward_Subgraph_Analysis_of_' + sanitize(startNode));
       var out = [];
       out.push('digraph "' + graphTitle + '" {');
+      // Flip vertical orientation for upstream so base models render on top
+      if (!isDown) out.push('  rankdir=BT;');
       out.push('  node [shape=box, style=filled];');
       out.push('  edge [color=blue];');
       out.push('');
@@ -1170,6 +1185,7 @@ const WORKER_SOURCE = `
       if (nodeLevels.size) {
         var groups = {};
         nodeLevels.forEach(function(l, n){ (groups[l] || (groups[l] = [])).push(n); });
+        // We still emit 0..maxLevel; rankdir=BT flips the vertical order for upstream.
         for (var l=0; l<=maxLevel; l++) {
           if (groups[l] && groups[l].length) {
             out.push('  { rank=same; ' + groups[l].map(function(n){ return quoteId(n); }).join('; ') + '; }');
