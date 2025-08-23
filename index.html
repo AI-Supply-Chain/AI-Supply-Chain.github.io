@@ -4,8 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI Supply Chain Graph Visualization and Analysis</title>
-
-  <!-- Site stylesheet -->
   <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
@@ -31,18 +29,10 @@
         <div class="input-group">
           <label for="algorithm">Direction of Traversal</label>
           <select id="algorithm">
-            <option value="DFS">⬇️ Forward/Downstream Graph Analysis</option> 
-            <option value="BFS">⬆️ Backward/Upstream Graph Analysis</option> ⬆️
+            <option value="DFS">⬇️ Forward/Downstream Graph Analysis</option>
+            <option value="BFS">⬆️ Backward/Upstream Graph Analysis</option>
           </select>
         </div>
-
-        <!-- <div class="input-group">
-          <label for="direction">Select a Direction</label>
-          <select id="direction">
-            <option value="downstream">⬇️ Downstream</option>
-            <option value="upstream">⬆️ Upstream</option>
-          </select>
-        </div> -->
 
         <!-- Direction (hidden, still in DOM) -->
         <div class="input-group hidden-ui" aria-hidden="true">
@@ -60,45 +50,21 @@
 
         <div class="input-group span-2">
           <label for="startNodeTypeahead">Choose an AI model from the list</label>
-          <!-- <p>After Selecting an AI model please press Run Traversal to start the analysis.</p> -->
           <div class="select-row">
             <input id="startNodeTypeahead" list="modelOptions" placeholder="Type to search models (e.g., llama, yi, mistral)" />
             <datalist id="modelOptions"></datalist>
             <button type="button" class="secondary" onclick="useSelectedStartNode()">☑️ Select</button>
           </div>
-            <!-- New: subtle note placed AFTER the box -->
-            <p class="helper-note" role="note">
-              After selecting an AI model, press <strong>Run Traversal</strong> to start the analysis.
-            </p>
+          <p class="helper-note" role="note">
+            After selecting an AI model, press <strong>Run Traversal</strong> to start the analysis.
+          </p>
         </div>
-
-        <!-- <div class="input-group span-2">
-          <label for="startNode">Starting Model Name</label>
-          <input type="text" id="startNode" placeholder="Enter a model present in the graph" />
-        </div> -->
 
         <!-- Starting Model Name (hidden, still in DOM) -->
         <div class="input-group span-2 hidden-ui" aria-hidden="true">
           <label for="startNode">Starting Model Name</label>
           <input type="text" id="startNode" placeholder="Enter a model present in the graph" />
         </div>
-
-        <!-- <div class="input-group">
-          <label for="maxDepth">Desired Graph Level (1–50)</label>
-          <input type="number" id="maxDepth" value="5" min="1" max="50" />
-        </div> -->
-
-        <!-- <div class="input-group">
-          <label for="layout">Layout (Graphviz)</label>
-          <select id="layout" disabled>
-            <option value="dot">dot (hierarchical)</option>
-            <option value="neato">neato</option>
-            <option value="fdp">fdp</option>
-            <option value="circo">circo</option>
-            <option value="twopi">twopi</option>
-          </select>
-          <small class="hint">Disabled; we use D3 force layout and Sigma for performance.</small>
-        </div> -->
 
         <!-- Layout (hidden, still in DOM) -->
         <div class="input-group hidden-ui" aria-hidden="true">
@@ -118,12 +84,10 @@
     <!-- ACTION BUTTONS -->
     <div class="button-group">
       <button onclick="performTraversal()">🚀 Run Traversal</button>
-      <!-- <button onclick="showGraphStats()" class="secondary">📊 Stats</button> -->
-      <!-- <button onclick="loadFullGraph()" class="secondary">📈 Full Graph</button> -->
       <button onclick="clearResults()" class="secondary">🗑️ Clear</button>
     </div>
 
-    <!-- STATUS (accessible) -->
+    <!-- STATUS -->
     <div id="status" class="status" role="status" aria-live="polite"></div>
 
     <!-- OUTPUT -->
@@ -147,13 +111,9 @@
     </div>
   </div>
 
-  <!-- LIBS (defer so DOM is ready) -->
+  <!-- LIBS -->
   <script src="https://unpkg.com/d3@7/dist/d3.min.js" defer></script>
-
-  <!-- UI helpers must load before main app -->
   <script src="js/ui.js" defer></script>
-
-  <!-- APP SCRIPT (parser, traversal, renderers) -->
   <script src="js/graph-logic.js" defer></script>
 </body>
 </html>

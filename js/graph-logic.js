@@ -13,7 +13,7 @@ let __d3Cleanup = null;
 let worker = null;
 let currentRunId = 0; // cancel token for concurrent runs
 
-// Expose for Stats pane
+// Expose for Stats pane / debugging
 window.fullGraph = fullGraph;
 window.reverseGraph = reverseGraph;
 window.nodeLabelsGlobal = nodeLabelsGlobal;
@@ -25,14 +25,46 @@ window.lastDirection = 'downstream';
 const BIG_NODES = 250;           // switch to WebGL/Sigma above this
 const BIG_EDGES = 400;
 
-const MAX_SVG_LABEL_NODES = 150; // show SVG labels only if <= this
+const MAX_SVG_LABEL_NODES = 150; // show node labels only if <= this
 const MAX_SVG_ARROW_EDGES = 300; // draw arrowheads only if <= this
 const MAX_FORCE_TICKS = 320;     // cap D3 tick count
+const MAX_EDGE_TEXT = 320;       // draw edge-type text only if <= this
 
 // datalist (29k) behaviour
 const DL_MIN_CHARS = 2;
 const DL_MAX_SUGGESTIONS = 500;
 const DL_CHUNK = 100;
+
+/* =========================
+   EDGE TYPE NORMALIZATION
+   ========================= */
+function normalizeEdgeType(raw) {
+  if (!raw) return { type: null, abbr: null };
+  const s = String(raw).toLowerCase().trim();
+
+  // common cleanups
+  const t = s.replace(/[_-]/g, '').replace(/\s+/g, '');
+
+  // Quantization
+  if (s.includes('quant') || s.includes('gguf')) return { type: 'quantized', abbr: 'QN' };
+
+  // Merge
+  if (s.includes('merge')) return { type: 'merge', abbr: 'MR' };
+
+  // Adapter/LoRA
+  if (s.includes('adapter') || s.includes('adapters') || s.includes('lora') || s.includes('qlora')) {
+    return { type: 'adapter', abbr: 'AD' };
+  }
+
+  // Finetune variants
+  if (s.includes('finetune') || s.includes('fine-tune') || s.includes('fine tune') ||
+      t.includes('finetuned') || s === 'sft' || s.includes('sft') || s === 'dpo') {
+    return { type: 'finetune', abbr: 'FT' };
+  }
+
+  // Fallback: unknown
+  return { type: null, abbr: null };
+}
 
 /* =========================
    BOOT
@@ -126,7 +158,7 @@ function initWorker() {
       if (msg.phase === 'fetch') showStatus('Loading graph file…', '');
       else if (msg.phase === 'parse') showStatus(`Parsing DOT… ${msg.lines||0} lines`, '');
       else if (msg.phase === 'traverse') showStatus(`Traversing (${msg.algorithm})…`, '');
-      else if (msg.phase === 'prep') showStatus(`Preparing visualization…`, '');
+      else if (msg.phase === 'prep') showStatus('Preparing visualization…', '');
     } else if (msg.type === 'result') {
       if (msg.runId !== currentRunId) return; // stale
       // Update globals for Stats feature
@@ -200,7 +232,7 @@ function toAbsoluteURL(p) {
 }
 
 /* =========================
-   RENDERING (chooses engine)
+   RENDERING (chooser)
    ========================= */
 async function renderGraph(input) {
   const container = document.getElementById('graphviz-container');
@@ -234,11 +266,13 @@ function countDotNodesEdges(dotContent) {
 }
 
 /* =========================
-   DOT→nodes/edges (self-loop safe)
+   DOT→nodes/edges (self-loop safe, types)
    ========================= */
 function parseNodesEdgesFromDot(dotContent) {
   const lines = dotContent.split('\n'); const nodes = []; const edges = [];
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.trim();
+    // Node with label including level
     const nodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+?)\\nLevel:\s*(\d+)(?:\\nSteps:\s*(\d+))?(?:\\n\[(?:BASE|TERMINAL)\])?".*\]/);
     if (nodeMatch) {
       const id = unquote(nodeMatch[1]); const label = nodeMatch[2];
@@ -250,18 +284,33 @@ function parseNodesEdgesFromDot(dotContent) {
       const id = unquote(simpleNodeMatch[1]); const label = simpleNodeMatch[2]; const level = parseInt(simpleNodeMatch[3],10)||0;
       nodes.push({ id, display:label, level, isExtreme:false }); continue;
     }
-    const edgeMatch = line.match(/"([^"]+)"\s*->\s*"([^"]+)"/);
+    // Generic node (no level info)
+    const plainNodeMatch = line.match(/^"([^"]+)"\s*\[.*\]/);
+    if (plainNodeMatch && !line.includes('->')) {
+      const id = unquote(plainNodeMatch[1]);
+      if (!nodes.find(n => n.id === id)) nodes.push({ id, display: id, level: 0, isExtreme:false });
+      continue;
+    }
+
+    // Edge with optional attributes
+    const edgeMatch = line.match(/"([^"]+)"\s*->\s*"([^"]+)"(?:\s*\[(.*?)\])?/);
     if (edgeMatch) {
       const s = unquote(edgeMatch[1]);
       const t = unquote(edgeMatch[2]);
       if (s === t) continue; // skip self-loop
-      edges.push({ source: s, target: t });
+      let etypeRaw = null;
+      const attrs = edgeMatch[3] || '';
+      const lm = attrs.match(/label\s*=\s*"([^"]*)"/i);
+      if (lm) etypeRaw = lm[1];
+      const norm = normalizeEdgeType(etypeRaw);
+      edges.push({ source: s, target: t, etype: norm.type, etypeAbbr: norm.abbr });
     }
   }
+
   return {
     nodes,
-    edges: dedupeEdges(edges.map(e => ({ from:e.source, to:e.target })))
-             .map(e => ({ source:e.from, target:e.to }))
+    edges: dedupeEdges(edges.map(e => ({ from:e.source, to:e.target, etype:e.etype, etypeAbbr:e.etypeAbbr })))
+             .map(e => ({ source:e.from, target:e.to, etype:e.etype, etypeAbbr:e.etypeAbbr }))
   };
 }
 
@@ -277,7 +326,7 @@ function dedupeEdges(edges) {
 }
 
 /* =========================
-   D3 (SMALL GRAPHS)
+   D3 (SMALL GRAPHS) with edge labels
    ========================= */
 async function renderWithD3ForceSmall(nodes, edges, container) {
   const width = container.clientWidth || 1200;
@@ -287,8 +336,10 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
   const g = svg.append('g');
   const zoom = d3.zoom().scaleExtent([0.1, 4]).on('zoom', (event)=> g.attr('transform', event.transform)); svg.call(zoom);
 
-  const showLabels = nodes.length <= MAX_SVG_LABEL_NODES;
+  const showNodeLabels = nodes.length <= MAX_SVG_LABEL_NODES;
   const useArrows = edges.length <= MAX_SVG_ARROW_EDGES;
+  const showEdgeText = edges.length <= MAX_EDGE_TEXT;
+
   if (useArrows) {
     svg.append('defs').append('marker')
       .attr('id', 'arrowhead').attr('viewBox', '0 -5 10 10')
@@ -308,6 +359,20 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
     .attr('stroke', '#999').attr('stroke-opacity', 0.7).attr('stroke-width', 1.8)
     .attr('marker-end', useArrows ? 'url(#arrowhead)' : null);
 
+  // Edge type text (midpoint)
+  let edgeText = null;
+  if (showEdgeText) {
+    edgeText = g.append('g').selectAll('text.edgelabel')
+      .data(edges.filter(e => e.etypeAbbr))
+      .enter().append('text')
+        .attr('class', 'edgelabel')
+        .attr('font-size', '9px')
+        .attr('font-family', 'Arial, sans-serif')
+        .attr('fill', '#444')
+        .attr('text-anchor', 'middle')
+        .text(d => d.etypeAbbr);
+  }
+
   const maxLevel = Math.max(0, ...nodes.map(d => d.level || 0));
   const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, maxLevel || 1]);
 
@@ -319,7 +384,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
     .style('cursor', 'pointer');
 
   let labels, levelLabels;
-  if (showLabels) {
+  if (showNodeLabels) {
     labels = g.append('g').selectAll('text.label').data(nodes).enter().append('text')
       .attr('class', 'label')
       .text(d => (d.display || d.id).length > 12 ? (d.display || d.id).slice(0, 9) + '…' : (d.display || d.id))
@@ -334,6 +399,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
       .attr('font-weight', 'bold').style('pointer-events', 'none');
   }
 
+  // Tooltip
   const tip = document.createElement('div');
   tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
   container.appendChild(tip);
@@ -358,12 +424,21 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
   let ticks = 0;
   simulation.on('tick', () => {
     if (++ticks >= MAX_FORCE_TICKS || simulation.alpha() < 0.02) simulation.stop();
+
     link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
         .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+
     node.attr('cx', d => d.x).attr('cy', d => d.y);
-    if (showLabels) {
+
+    if (showNodeLabels) {
       labels.attr('x', d => d.x).attr('y', d => d.y);
       levelLabels.attr('x', d => d.x).attr('y', d => d.y);
+    }
+
+    if (edgeText) {
+      edgeText
+        .attr('x', d => (d.source.x + d.target.x) / 2)
+        .attr('y', d => (d.source.y + d.target.y) / 2);
     }
   });
 
@@ -375,7 +450,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
   const helper = document.createElement('div');
   helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
   const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br>• Drag nodes: move<br><br><strong>Legend:</strong><br>• Color = depth level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br>• Drag nodes: move<br><br><strong>Legend:</strong><br>• Color = depth level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
   container.appendChild(helper);
 
   __d3Cleanup = () => { try { simulation.stop(); } catch {}; try { svg.remove(); } catch {}; try { tip.remove(); } catch {}; try { helper.remove(); } catch {}; };
@@ -383,8 +458,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
 
 /* =========================
    SIGMA (BIG GRAPHS)
-   Now with hover tooltip + Controls/Legend overlay,
-   labels appear only when zoomed in (label threshold).
+   - hover tooltip shows edge type
    ========================= */
 async function renderWithSigmaLayered(nodes, edges, container) {
   await loadScriptOnce('https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js', () => !!window.graphology);
@@ -419,7 +493,7 @@ async function renderWithSigmaLayered(nodes, edges, container) {
         if (!graph.hasNode(nd.id)) graph.addNode(nd.id, {
           x, y,
           size: nd.isExtreme ? 6.5 : 5,
-          label: trunc(nd.display || nd.id), // enable zoomed labels
+          label: trunc(nd.display || nd.id),
           color: colorFor(lvl),
           level: lvl
         });
@@ -438,7 +512,11 @@ async function renderWithSigmaLayered(nodes, edges, container) {
       const to   = e.target || e.to;
       if (from === to) continue; // skip self-loop
       if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from, to)) {
-        try { graph.addEdge(from, to, { size: 1 }); } catch {}
+        try { graph.addEdge(from, to, {
+          size: 1,
+          etype: e.etype || null,
+          etypeAbbr: e.etypeAbbr || null
+        }); } catch {}
       }
     }
     await new Promise(r=>setTimeout(r,0));
@@ -448,7 +526,7 @@ async function renderWithSigmaLayered(nodes, edges, container) {
   container.innerHTML = '';
   __sigmaRenderer = new SigmaCtor(graph, container, {
     renderLabels: true,
-    labelRenderedSizeThreshold: 12,  // must be big on screen to draw label
+    labelRenderedSizeThreshold: 12,
     enableEdgeHoverEvents: true
   });
 
@@ -462,21 +540,28 @@ async function renderWithSigmaLayered(nodes, edges, container) {
     tip.textContent = `${attrs.label || node} (Level ${attrs.level || 0})`;
     tip.style.display = 'block';
   });
-  __sigmaRenderer.on('leaveNode', () => {
-    tip.style.display = 'none';
+  __sigmaRenderer.on('leaveNode', () => { tip.style.display = 'none'; });
+
+  // Edge hover: show type
+  __sigmaRenderer.on('enterEdge', ({ edge }) => {
+    const a = graph.getEdgeAttributes(edge);
+    const msg = a.etypeAbbr ? `Edge type: ${a.etypeAbbr}` : 'Edge';
+    tip.textContent = msg;
+    tip.style.display = 'block';
   });
+  __sigmaRenderer.on('leaveEdge', () => { tip.style.display = 'none'; });
+
   __sigmaRenderer.getMouseCaptor().on('mousemoveBody', (e) => {
-    // position near cursor inside container
-    const rect = container.getBoundingClientRect();
-    tip.style.left = (e.x - rect.left + 12) + 'px';
-    tip.style.top  = (e.y - rect.top  - 10) + 'px';
+    const rect2 = container.getBoundingClientRect();
+    tip.style.left = (e.x - rect2.left + 12) + 'px';
+    tip.style.top  = (e.y - rect2.top  - 10) + 'px';
   });
 
-  // Controls & legend overlay (like D3)
+  // Controls & legend overlay
   const helper = document.createElement('div');
   helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
   const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
   container.appendChild(helper);
 }
 
@@ -514,7 +599,7 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
       const e = edges[ei]; const from = e.source || e.from; const to = e.target || e.to;
       if (from === to) continue;
       if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from,to)) {
-        try { graph.addEdge(from,to,{ size:1 }); } catch {}
+        try { graph.addEdge(from,to,{ size:1, etype: e.etype || null, etypeAbbr: e.etypeAbbr || null }); } catch {}
       }
     }
     await new Promise(r=>setTimeout(r,0));
@@ -537,60 +622,68 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
     tip.style.display = 'block';
   });
   __sigmaRenderer.on('leaveNode', () => { tip.style.display = 'none'; });
+  __sigmaRenderer.on('enterEdge', ({ edge }) => {
+    const a = graph.getEdgeAttributes(edge);
+    tip.textContent = a.etypeAbbr ? `Edge type: ${a.etypeAbbr}` : 'Edge';
+    tip.style.display = 'block';
+  });
+  __sigmaRenderer.on('leaveEdge', () => { tip.style.display = 'none'; });
   __sigmaRenderer.getMouseCaptor().on('mousemoveBody', (e) => {
-    const rect = container.getBoundingClientRect();
-    tip.style.left = (e.x - rect.left + 12) + 'px';
-    tip.style.top  = (e.y - rect.top  - 10) + 'px';
+    const rect2 = container.getBoundingClientRect();
+    tip.style.left = (e.x - rect2.left + 12) + 'px';
+    tip.style.top  = (e.y - rect2.top  - 10) + 'px';
   });
 
   const helper = document.createElement('div');
   helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
   const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node`;
+  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
   container.appendChild(helper);
 }
 
-/* =========================
-   DOT helpers + UI helpers
-   ========================= */
-const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
+// /* =========================
+//    DOT helpers + UI helpers
+//    ========================= */
+// const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
 
-function showStatus(message, type) {
-  const el = document.getElementById('status');
-  el.textContent = message;
-  el.className = `status ${type||''}`;
-  el.style.display = message ? 'block' : 'none';
-}
-function clearResults(){
-  const c = document.getElementById('graphviz-container');
-  c.innerHTML = '<div style="text-align:center; padding:50px; color:#666;">Enter a model and run traversal</div>';
-  const out = document.getElementById('dotOutput'); if (out) out.value='';
-  showStatus('Results cleared', 'success');
-}
-function showGraphStats(){
-  const nodeCount = Object.keys(window.fullGraph||{}).length;
-  const revCount = Object.keys(window.reverseGraph||{}).length;
-  const edgeCount = Object.values(window.fullGraph||{}).reduce((s,n)=>s+(n?.length||0),0);
-  alert(`Forward nodes: ${nodeCount}\nReverse nodes: ${revCount}\nEdges: ${edgeCount}`);
-}
-function copyDotFormat(){
-  const ta = document.getElementById('dotOutput'); if (!ta || !ta.value) return showStatus('No content to copy', 'error');
-  ta.select(); document.execCommand('copy'); showStatus('DOT copied to clipboard', 'success');
-}
-function downloadDotFile(){
-  const text = document.getElementById('dotOutput')?.value || '';
-  if (!text) return showStatus('No traversal results to download', 'error');
-  const modelSafe = (document.getElementById('startNode')?.value || 'model').trim().replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,'_');
-  const algo = document.getElementById('algorithm')?.value;
-  const filename = (algo==='DFS') ? `Forward_analysis_of_${modelSafe}.dot` : `Backward_analysis_of_${modelSafe}.dot`;
-  const blob = new Blob([text], { type:'text/plain' });
-  const link = document.createElement('a'); link.download = filename; link.href = window.URL.createObjectURL(blob); link.click();
-  window.URL.revokeObjectURL(link.href); showStatus(`Saved: ${filename}`, 'success');
-}
-window.clearResults = clearResults;
-window.showGraphStats = showGraphStats;
-window.copyDotFormat = copyDotFormat;
-window.downloadDotFile = downloadDotFile;
+// function showStatus(message, type) {
+//   // Provided by ui.js too; keep a safe local if needed
+//   const el = document.getElementById('status');
+//   if (!el) return;
+//   el.textContent = message;
+//   el.className = `status ${type||''}`;
+//   el.style.display = message ? 'block' : 'none';
+// }
+// function clearResults(){
+//   const c = document.getElementById('graphviz-container');
+//   c.innerHTML = '<div style="text-align:center; padding:50px; color:#666;">Enter a model and run traversal</div>';
+//   const out = document.getElementById('dotOutput'); if (out) out.value='';
+//   showStatus('Results cleared', 'success');
+// }
+// function showGraphStats(){
+//   const nodeCount = Object.keys(window.fullGraph||{}).length;
+//   const revCount = Object.keys(window.reverseGraph||{}).length;
+//   const edgeCount = Object.values(window.fullGraph||{}).reduce((s,n)=>s+(n?.length||0),0);
+//   alert(`Forward nodes: ${nodeCount}\nReverse nodes: ${revCount}\nEdges: ${edgeCount}`);
+// }
+// function copyDotFormat(){
+//   const ta = document.getElementById('dotOutput'); if (!ta || !ta.value) return showStatus('No content to copy', 'error');
+//   ta.select(); document.execCommand('copy'); showStatus('DOT copied to clipboard', 'success');
+// }
+// function downloadDotFile(){
+//   const text = document.getElementById('dotOutput')?.value || '';
+//   if (!text) return showStatus('No traversal results to download', 'error');
+//   const modelSafe = (document.getElementById('startNode')?.value || 'model').trim().replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,'_');
+//   const algo = document.getElementById('algorithm')?.value;
+//   const filename = (algo==='DFS') ? `Forward_analysis_of_${modelSafe}.dot` : `Backward_analysis_of_${modelSafe}.dot`;
+//   const blob = new Blob([text], { type:'text/plain' });
+//   const link = document.createElement('a'); link.download = filename; link.href = window.URL.createObjectURL(blob); link.click();
+//   window.URL.revokeObjectURL(link.href); showStatus(`Saved: ${filename}`, 'success');
+// }
+// window.clearResults = clearResults;
+// window.showGraphStats = showGraphStats;
+// window.copyDotFormat = copyDotFormat;
+// window.downloadDotFile = downloadDotFile;
 
 /* =========================
    UTIL: loadScriptOnce
@@ -617,12 +710,26 @@ function loadScriptOnce(src, checkFn){
 }
 
 /* =========================
-   WORKER SOURCE (as string)
+   WORKER SOURCE (string)
+   - parses edge label => normalized etype + abbr
+   - carries etype into traversal edges
    ========================= */
 const WORKER_SOURCE = `
   const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
-  const quoteId = (s) => \`"\${String(s).replace(/"/g, '\\\\\\"')}"\`;
-  const escLbl  = (s) => String(s).replace(/"/g, '\\\\\\"');
+  const quoteId = (s) => \`"\${String(s).replace(/"/g, '\\\\"')}"\`;
+  const escLbl  = (s) => String(s).replace(/"/g, '\\\\"');
+
+  function normalizeEdgeType(raw) {
+    if (!raw) return { type: null, abbr: null };
+    const s = String(raw).toLowerCase().trim();
+    const t = s.replace(/[_-]/g, '').replace(/\\s+/g, '');
+    if (s.includes('quant') || s.includes('gguf')) return { type: 'quantized', abbr: 'QN' };
+    if (s.includes('merge')) return { type: 'merge', abbr: 'MR' };
+    if (s.includes('adapter') || s.includes('adapters') || s.includes('lora') || s.includes('qlora')) return { type: 'adapter', abbr: 'AD' };
+    if (s.includes('finetune') || s.includes('fine-tune') || s.includes('fine tune') ||
+        t.includes('finetuned') || s === 'sft' || s.includes('sft') || s === 'dpo') return { type: 'finetune', abbr: 'FT' };
+    return { type: null, abbr: null };
+  }
 
   self.onmessage = async (ev) => {
     const msg = ev.data || {};
@@ -634,7 +741,7 @@ const WORKER_SOURCE = `
       if (!res.ok) throw new Error(\`Failed to load \${filePath}: \${res.status}\`);
 
       // Stream + parse DOT
-      const { fullGraph, reverseGraph, labels, lines } = await parseDotStream(res.body);
+      const { fullGraph, reverseGraph, labels, lines, edgeTypes } = await parseDotStream(res.body);
       postMessage({ type: 'progress', phase: 'traverse', runId, algorithm });
 
       // Resolve start
@@ -642,10 +749,10 @@ const WORKER_SOURCE = `
       const actualStart = resolveStartNode(graph, startNode);
       if (!actualStart) throw new Error(\`Start node "\${startNode}" not found\`);
 
-      // Traverse
+      // Traverse (edge types carried along)
       const T = (algorithm === 'DFS')
-        ? traverseDFS(graph, actualStart, maxDepth, direction)
-        : traverseBFS(graph, actualStart, maxDepth, direction);
+        ? traverseDFS(graph, actualStart, maxDepth, direction, edgeTypes)
+        : traverseBFS(graph, actualStart, maxDepth, direction, edgeTypes);
 
       const maxLevel = Math.max(...T.levels.values());
       const nodes = T.order.map(id => ({
@@ -654,7 +761,8 @@ const WORKER_SOURCE = `
         level: T.levels.get(id) || 0,
         isExtreme: (T.levels.get(id) || 0) === maxLevel
       }));
-      const edges = dedupeEdges(T.edges).map(e => ({ source: e.from, target: e.to }));
+      // Dedup + convert to {source,target,etype,etypeAbbr}
+      const edges = dedupeEdges(T.edges).map(e => ({ source: e.from, target: e.to, etype: e.etype || null, etypeAbbr: e.etypeAbbr || null }));
 
       // Build paths only for extremes (for DOT comments)
       const extremes = []; for (const [n,l] of T.levels.entries()) if (l===maxLevel) extremes.push(n);
@@ -662,7 +770,7 @@ const WORKER_SOURCE = `
 
       postMessage({ type: 'progress', phase: 'prep', runId });
 
-      const dot = generateTraversalDot(T.order, T.edges, algorithm, actualStart, direction, T.levels, paths, labels);
+      const dot = generateTraversalDot(T.order, edges, algorithm, actualStart, direction, T.levels, paths, labels);
 
       postMessage({
         type: 'result', runId,
@@ -689,16 +797,17 @@ const WORKER_SOURCE = `
     return null;
   }
 
-  // Streaming DOT parser (line-by-line) – with self-loop filtering
+  // Streaming DOT parser (line-by-line) – with self-loop filtering + edge types
   async function parseDotStream(readable) {
     const dec = new TextDecoder();
     const full = {}, rev = {}, labels = {};
     const lines = [];
+    const edgeTypes = {}; // key: "from->to" => { type, abbr }
     let buf = '';
     let lineCount = 0;
 
     if (!readable) {
-      return { fullGraph: full, reverseGraph: rev, labels, lines: [] };
+      return { fullGraph: full, reverseGraph: rev, labels, lines: [], edgeTypes };
     }
 
     const reader = readable.getReader();
@@ -712,38 +821,55 @@ const WORKER_SOURCE = `
         const raw = buf.slice(0, idx);
         buf = buf.slice(idx + 1);
         lines.push(raw);
-        processDotLine(raw, full, rev, labels);
+        processDotLine(raw, full, rev, labels, edgeTypes);
         if ((++lineCount % 4000) === 0) postMessage({ type: 'progress', phase: 'parse', lines: lineCount });
       }
     }
-    if (buf) { lines.push(buf); processDotLine(buf, full, rev, labels); }
-    return { fullGraph: full, reverseGraph: rev, labels, lines };
+    if (buf) { lines.push(buf); processDotLine(buf, full, rev, labels, edgeTypes); }
+    return { fullGraph: full, reverseGraph: rev, labels, lines, edgeTypes };
   }
 
-  function processDotLine(raw, full, rev, labels) {
+  function processDotLine(raw, full, rev, labels, edgeTypes) {
     const line = raw.trim();
     if (!line || line === '{' || line === '}' || /^\\/\\//.test(line) || /^#/.test(line)) return;
     if (/(^|\\s)(digraph|graph)(\\s|\\{)/.test(line)) return;
 
     let m = line.match(/^"([^"]+)"\\s*\\[.*\\blabel="([^"]*)".*\\]/) ||
             line.match(/^([\\w./-]+)\\s*\\[.*\\blabel="([^"]*)".*\\]/);
-    if (m) {
+    if (m && !line.includes('->')) {
       const id = unquote(m[1]); const label = m[2];
       if (labels[id] === undefined) labels[id] = label;
       (full[id] ||= []); (rev[id] ||= []);
       return;
     }
-    m = line.match(/"([^"]+)"\\s*->\\s*"([^"]+)"/) || line.match(/([\\w./-]+)\\s*->\\s*([\\w./-]+)/);
+
+    // Edge with optional attr block
+    m = line.match(/"([^"]+)"\\s*->\\s*"([^"]+)"(?:\\s*\\[(.*?)\\])?/);
     if (m) {
       const from = unquote(m[1]); const to = unquote(m[2]);
       if (from === to) return; // skip self-loop
       (full[from] ||= []).push(to); (full[to] ||= []);
       (rev[to]   ||= []).push(from); (rev[from] ||= []);
+
+      const attrs = m[3] || '';
+      const lm = attrs.match(/label\\s*=\\s*"([^"]*)"/i);
+      if (lm) {
+        const norm = normalizeEdgeType(lm[1]);
+        edgeTypes[\`\${from}->\${to}\`] = norm;
+      }
+      return;
+    }
+
+    // Generic node without label
+    m = line.match(/^"([^"]+)"\\s*\\[/);
+    if (m && !line.includes('->')) {
+      const id = unquote(m[1]);
+      (full[id] ||= []); (rev[id] ||= []);
     }
   }
 
-  // Traversals with self-loop guard
-  function traverseDFS(graphObj, start, maxDepth, direction) {
+  // Traversals with self-loop guard + etype lookup
+  function traverseDFS(graphObj, start, maxDepth, direction, edgeTypes) {
     const stack = [[start, 0]];
     const visited = new Set();
     const order = [];
@@ -761,7 +887,11 @@ const WORKER_SOURCE = `
       for (let i = neighbors.length - 1; i >= 0; i--) {
         const nb = neighbors[i];
         if (nb === node) continue;  // self-loop guard
-        const edge = direction==='upstream' ? {from:nb,to:node,level:depth+1} : {from:node,to:nb,level:depth+1};
+        const key = (direction==='upstream') ? \`\${nb}->\${node}\` : \`\${node}->\${nb}\`;
+        const norm = edgeTypes[key] || { type: null, abbr: null };
+        const edge = direction==='upstream'
+          ? {from:nb,to:node,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr}
+          : {from:node,to:nb,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr};
         edges.push(edge);
         if (!visited.has(nb) && depth + 1 <= maxDepth) {
           if (!levels.has(nb)) levels.set(nb, depth + 1);
@@ -773,7 +903,7 @@ const WORKER_SOURCE = `
     return { order, edges, levels, parent };
   }
 
-  function traverseBFS(graphObj, start, maxDepth, direction) {
+  function traverseBFS(graphObj, start, maxDepth, direction, edgeTypes) {
     const queue = [[start, 0]];
     let qi = 0;
     const visited = new Set([start]);
@@ -788,7 +918,11 @@ const WORKER_SOURCE = `
       const neighbors = graphObj[node] || [];
       for (const nb of neighbors) {
         if (nb === node) continue; // self-loop guard
-        const edge = direction==='upstream' ? {from:nb,to:node,level:depth+1} : {from:node,to:nb,level:depth+1};
+        const key = (direction==='upstream') ? \`\${nb}->\${node}\` : \`\${node}->\${nb}\`;
+        const norm = edgeTypes[key] || { type: null, abbr: null };
+        const edge = direction==='upstream'
+          ? {from:nb,to:node,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr}
+          : {from:node,to:nb,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr};
         edges.push(edge);
         if (!visited.has(nb) && depth + 1 <= maxDepth) {
           visited.add(nb);
@@ -854,13 +988,16 @@ const WORKER_SOURCE = `
       out.push(\`  \${quoteId(node)} [fillcolor=\${color}, label="\${label}"\${nodeStyle}];\`);
     }
     out.push('');
-    out.push(\`  // Edges with level labels\`);
+    out.push(\`  // Edges with level and type\`);
     const seen = new Set();
     for (const e of edges) {
-      if (e.from === e.to) continue; // self-loop guard
-      const key = \`\${e.from}->\${e.to}\`; if (seen.has(key)) continue; seen.add(key);
-      const edgeLevel = (e.level !== undefined) ? \` [label="L\${e.level}"]\` : '';
-      out.push(\`  \${quoteId(e.from)} -> \${quoteId(e.to)}\${edgeLevel};\`);
+      if (e.source === e.target) continue;
+      const key = \`\${e.source}->\${e.target}\`; if (seen.has(key)) continue; seen.add(key);
+      const parts = [];
+      if (e.level !== undefined) parts.push(\`L\${e.level}\`);
+      if (e.etypeAbbr) parts.push(e.etypeAbbr);
+      const lbl = parts.length ? \` [label="\${parts.join(' | ')}"]\` : '';
+      out.push(\`  \${quoteId(e.source)} -> \${quoteId(e.target)}\${lbl};\`);
     }
     out.push('}');
     return out.join('\\n');

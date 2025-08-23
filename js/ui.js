@@ -2,10 +2,9 @@
 
 /**
  * UI helpers only: status, clear, copy, download, stats
- * These are loaded BEFORE graph-logic.js
+ * Loaded BEFORE graph-logic.js
  */
 
-/* Shared globals (graph-logic.js updates these) */
 window.fullGraph = window.fullGraph || {};
 window.reverseGraph = window.reverseGraph || {};
 window.lastDirection = window.lastDirection || 'downstream';
@@ -28,27 +27,12 @@ function clearResults() {
   showStatus('Results cleared', 'success');
 }
 
-function showGraphStats() {
-  const nodeCount = Object.keys(window.fullGraph || {}).length;
-  const reverseNodeCount = Object.keys(window.reverseGraph || {}).length;
-  const edgeCount = Object.values(window.fullGraph || {}).reduce((s, nbrs) => s + (nbrs?.length || 0), 0);
-  const sampleNodes = Object.keys(window.fullGraph || {}).slice(0, 10);
-
-  const stats = [
-    'Graph Statistics:',
-    `• Forward graph nodes: ${nodeCount}`,
-    `• Reverse graph nodes: ${reverseNodeCount}`,
-    `• Total edges: ${edgeCount}`,
-    `• Sample nodes: ${sampleNodes.join(', ')}${sampleNodes.length < nodeCount ? '…' : ''}`
-  ].join('\n');
-
-  alert(stats);
-  showStatus(`Graph: ${nodeCount} nodes, ${reverseNodeCount} reverse nodes, ${edgeCount} edges`, 'success');
-}
-
 async function copyDotFormat() {
   const ta = document.getElementById('dotOutput');
-  if (!ta || !ta.value) return showStatus('No content to copy', 'error');
+  if (!ta || !ta.value) {
+    showStatus('No content to copy', 'error');
+    return;
+  }
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(ta.value);
@@ -65,7 +49,10 @@ async function copyDotFormat() {
 
 function downloadDotFile() {
   const text = document.getElementById('dotOutput')?.value || '';
-  if (!text) return showStatus('No traversal results to download', 'error');
+  if (!text) {
+    showStatus('No traversal results to download', 'error');
+    return;
+  }
 
   const modelSafe = (document.getElementById('startNode')?.value || 'model')
     .trim()
@@ -73,9 +60,10 @@ function downloadDotFile() {
     .replace(/[^a-zA-Z0-9_]/g, '_');
 
   const algo = document.getElementById('algorithm')?.value; // 'DFS' or 'BFS'
+  // Match graph-logic.js original naming to avoid behavior change
   const filename = (algo === 'DFS')
-    ? `Forward_analysis_of_model_${modelSafe}.dot`
-    : `Backward_analysis_of_model_${modelSafe}.dot`;
+    ? `Forward_analysis_of_${modelSafe}.dot`
+    : `Backward_analysis_of_${modelSafe}.dot`;
 
   const blob = new Blob([text], { type: 'text/plain' });
   const link = document.createElement('a');
@@ -87,7 +75,31 @@ function downloadDotFile() {
   showStatus(`Saved: ${filename}`, 'success');
 }
 
-/* Expose to window for inline handlers */
+function showGraphStats() {
+  const nodeCount = Object.keys(window.fullGraph || {}).length;
+  const reverseNodeCount = Object.keys(window.reverseGraph || {}).length;
+  const edgeCount = Object.values(window.fullGraph || {}).reduce(
+    (s, nbrs) => s + (nbrs?.length || 0),
+    0
+  );
+  const sampleNodes = Object.keys(window.fullGraph || {}).slice(0, 10);
+
+  const stats = [
+    'Graph Statistics:',
+    `• Forward graph nodes: ${nodeCount}`,
+    `• Reverse graph nodes: ${reverseNodeCount}`,
+    `• Total edges: ${edgeCount}`,
+    `• Sample nodes: ${sampleNodes.join(', ')}${sampleNodes.length < nodeCount ? '…' : ''}`
+  ].join('\n');
+
+  alert(stats);
+  showStatus(
+    `Graph: ${nodeCount} nodes, ${reverseNodeCount} reverse nodes, ${edgeCount} edges`,
+    'success'
+  );
+}
+
+/* Expose to window for inline handlers and graph-logic.js */
 window.showStatus = showStatus;
 window.clearResults = clearResults;
 window.copyDotFormat = copyDotFormat;
