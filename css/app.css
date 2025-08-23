@@ -254,13 +254,13 @@ textarea:focus-visible {
 
 /* Adjust split: Visualization wider, DOT Output narrower */
 .output-section .panel:first-child {  /* Visualization */
-  flex: 0 1 56%;
+  flex: 0 1 57%;
   display: flex;
   flex-direction: column;
 }
 
 .output-section .panel:last-child {   /* DOT Format Output */
-  flex: 0 1 44%;
+  flex: 0 1 43%;
   display: flex;
   flex-direction: column;
 }
