@@ -246,11 +246,25 @@ textarea:focus-visible {
   gap:var(--gap);
   align-items:stretch;
 }
-.output-section .panel {
+/* .output-section .panel {
   flex:1;
   display:flex;
   flex-direction:column;
+} */
+
+/* Adjust split: Visualization wider, DOT Output narrower */
+.output-section .panel:first-child {  /* Visualization */
+  flex: 0 1 56%;
+  display: flex;
+  flex-direction: column;
 }
+
+.output-section .panel:last-child {   /* DOT Format Output */
+  flex: 0 1 44%;
+  display: flex;
+  flex-direction: column;
+}
+
 .output-section .viz-surface,
 .output-section .codewrap {
   flex:1;                /* grow to fill panel */
