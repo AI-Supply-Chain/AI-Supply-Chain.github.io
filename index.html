@@ -25,10 +25,10 @@
   <section class="hero container">
     <div class="hero-card card">
       <div class="hero-head">
-        <h1 class="hero-title"> AI Models' Supply Chain Analysis</h1>
+        <h1 class="hero-title">AI Models' Supply Chain Analysis</h1>
         <p class="hero-sub">
           Analyze  forward/downstream and backward/upstream supply chain relationships among AI models using directed graph traversal.
-          Explore fine-tuning, adapter, quantization, and merge lineages — then export ranked DOT subgraphs
+          Explore fine-tuning, adapter, quantization, and merge relationships — then export ranked DOT subgraphs
           for reproducible research.
         </p>
       </div>
@@ -63,8 +63,7 @@
         <h3>2. Quick Start</h3>
         <ol>
           <li>Click <strong>Launch Simulation</strong> to open the interactive app.</li>
-          <li>Ensure the <em>Graph File Path</em> points to your served <code>.dot</code> file (default:
-            <code>AI-Supply-Chain-Graph.dot</code>).</li>
+          <li>Ensure the <em>Graph File Path</em> points to your served <code>.dot</code> file.</li>
           <li>Choose a direction: <em>Forward/Downstream</em> or <em>Backward/Upstream</em>.</li>
           <li>Type 2–3 characters in the model search box, select a model, then click <strong>Run Traversal</strong>.</li>
           <li>Explore the visualization and copy/download the generated DOT subgraph.</li>
@@ -89,13 +88,12 @@
         <h3>4. Data Requirements</h3>
         <p>
           Input must be a valid Graphviz <code>digraph</code>. Edges can provide <code>label=</code> attributes
-          (e.g., <code>label="finetune"</code>) to classify as FT/AD/QN/MR; otherwise a sensible default (FT) is applied.
+          (e.g., <code>label="finetune"</code>) to classify as FT/AD/QN/MR.
         </p>
 
         <h3>5. Exported DOT</h3>
         <p>
-          The app emits a compact DOT with level ranks, edge-type labels, and comments detailing node counts,
-          max depth, and paths to extremes (terminal/base).
+          The app generates a compact DOT file with ranks, edge labels, and notes on node counts, depth, and key paths to terminal or base nodes.
         </p>
 
         <h3>6. Performance Tips</h3>
