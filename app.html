@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Supply Chain Graph Visualization and Analysis</title>
+
+  <!-- App-only stylesheet (keeps your JS IDs/markup intact) -->
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- HEADER -->
+    <div class="header">
+      <h1>AI Supply Chain Graph Analysis</h1>
+    </div>
+
+    <!-- FILE PATH -->
+    <div class="file-path-section">
+      <div class="input-group">
+        <label for="filePath">📁 Graph File Path</label>
+        <input type="text" id="filePath" placeholder="Path to the .dot file" value="AI-Supply-Chain-Graph.dot" />
+        <!-- <small class="hint">Point this to your actual DOT file (served from the same origin).</small> -->
+      </div>
+    </div>
+
+    <!-- INPUTS -->
+    <div class="input-section">
+      <div class="grid">
+        <!-- Visible direction control (drives hidden #direction) -->
+        <div class="input-group">
+          <label for="algorithm">Direction of Traversal</label>
+          <select id="algorithm">
+            <option value="DFS">⬇️ Forward/Downstream Graph Analysis</option>
+            <option value="BFS">⬆️ Backward/Upstream Graph Analysis</option>
+          </select>
+        </div>
+
+        <!-- Hidden direction (kept for logic; synced by JS) -->
+        <div class="input-group hidden-ui" aria-hidden="true">
+          <label for="direction">Select a Direction</label>
+          <select id="direction">
+            <option value="downstream">⬇️ Downstream</option>
+            <option value="upstream">⬆️ Upstream</option>
+          </select>
+        </div>
+
+        <div class="input-group">
+          <label for="maxDepth">Desired Graph Level (1–50)</label>
+          <input type="number" id="maxDepth" value="5" min="1" max="50" />
+        </div>
+
+        <!-- Typeahead (input + datalist + actions) -->
+        <div class="input-group span-2">
+          <label for="startNodeTypeahead">Choose an AI model from the list</label>
+          <div class="select-row">
+            <input
+              id="startNodeTypeahead"
+              list="modelOptions"
+              placeholder="Type 2–3+ characters (e.g., llama, yi, mistral)…"
+              autocomplete="off"
+              inputmode="search"
+            />
+            <datalist id="modelOptions"></datalist>
+
+            <button type="button" class="btn secondary" onclick="useSelectedStartNode()">☑️ Select</button>
+            <button type="button" class="btn" onclick="performTraversal()">🚀 Run Traversal</button>
+            <button type="button" class="btn secondary" onclick="clearResults()">🗑️ Clear</button>
+          </div>
+          <p class="helper-note" role="note">
+            Start typing to see suggestions. Click <strong>Select</strong> (or press Enter), then click <strong>Run Traversal</strong>.
+          </p>
+        </div>
+
+        <!-- Hidden starting node field used by the logic -->
+        <div class="input-group span-2 hidden-ui" aria-hidden="true">
+          <label for="startNode">Starting Model Name</label>
+          <input type="text" id="startNode" placeholder="Selected model will appear here" />
+        </div>
+
+        <!-- Layout (kept but disabled; we use D3/Sigma) -->
+        <div class="input-group hidden-ui" aria-hidden="true">
+          <label for="layout">Layout (Graphviz)</label>
+          <select id="layout" disabled>
+            <option value="dot">dot (hierarchical)</option>
+            <option value="neato">neato</option>
+            <option value="fdp">fdp</option>
+            <option value="circo">circo</option>
+            <option value="twopi">twopi</option>
+          </select>
+          <small class="hint">Disabled; D3 force layout and Sigma are used for performance.</small>
+        </div>
+      </div>
+    </div>
+
+    <!-- STATUS -->
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+
+    <!-- OUTPUT -->
+    <div class="output-section">
+      <div class="grid">
+        <!-- Visualization panel -->
+        <figure class="panel">
+          <header class="panel__header">
+            <h2 class="panel__title">Visualization</h2>
+            <div class="panel__tools"></div>
+          </header>
+
+          <div id="graphviz-container" class="viz-surface">
+            <div class="placeholder">Pick a model and click <em>Run Traversal</em></div>
+          </div>
+
+          <figcaption class="panel__caption">
+            Directed subgraph view. Node color encodes depth (level), and red outline highlights extremes
+            depending on traversal direction.
+          </figcaption>
+        </figure>
+
+        <!-- DOT panel -->
+        <figure class="panel">
+          <header class="panel__header">
+            <h2 class="panel__title">DOT Format Output</h2>
+            <div class="panel__tools">
+              <button onclick="copyDotFormat()" class="btn btn-ghost" title="Copy to clipboard">📋 Copy</button>
+              <button onclick="downloadDotFile()" class="btn btn-ghost" title="Download .dot">⬇️ Download</button>
+            </div>
+          </header>
+
+          <div class="codewrap">
+            <!-- <label for="dotOutput" class="sr-only">DOT output</label> -->
+            <textarea class="dot-textarea code-surface" id="dotOutput" readonly></textarea>
+          </div>
+
+          <figcaption class="panel__caption">
+            Traversal export in Graphviz DOT with level ranks and edge-type labels (FT, AD, QN, MR).
+          </figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+
+  <!-- FOOTER (centered under the container) -->
+  <footer class="site-footer">
+    © 2025 Graph Lab UTA — AI Supply Chain Graph Analysis · All rights reserved
+  </footer>
+
+  <!-- JS (order matters) -->
+  <script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/graph-logic.js"></script>
+</body>
+</html>

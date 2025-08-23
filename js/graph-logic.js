@@ -1,70 +1,50 @@
 'use strict';
 
 /* =========================
-   GLOBAL STATE (main thread)
+   GLOBAL STATE
    ========================= */
 let fullGraph = {};
 let reverseGraph = {};
 let dotFileLines = [];
 let nodeLabelsGlobal = {};
-let MODEL_CHOICES = [];
 let __sigmaRenderer = null;
 let __d3Cleanup = null;
 let worker = null;
-let currentRunId = 0; // cancel token for concurrent runs
+let currentRunId = 0;
 
-// Expose for Stats pane / debugging
 window.fullGraph = fullGraph;
 window.reverseGraph = reverseGraph;
 window.nodeLabelsGlobal = nodeLabelsGlobal;
 window.lastDirection = 'downstream';
 
 /* =========================
-   TUNABLES
+   CONSTANTS / TUNABLES
    ========================= */
-const BIG_NODES = 250;           // switch to WebGL/Sigma above this
+const BIG_NODES = 250;
 const BIG_EDGES = 400;
 
-const MAX_SVG_LABEL_NODES = 150; // show node labels only if <= this
-const MAX_SVG_ARROW_EDGES = 300; // draw arrowheads only if <= this
-const MAX_FORCE_TICKS = 320;     // cap D3 tick count
-const MAX_EDGE_TEXT = 320;       // draw edge-type text only if <= this
+const MAX_SVG_LABEL_NODES = 150;
+const MAX_SVG_ARROW_EDGES = 300;
+const MAX_FORCE_TICKS = 320;
+const MAX_EDGE_TEXT = 320;
 
-// datalist (29k) behaviour
-const DL_MIN_CHARS = 2;
-const DL_MAX_SUGGESTIONS = 500;
-const DL_CHUNK = 100;
+const DEFAULT_EDGE_TYPE = { type: 'finetune', abbr: 'FT' };
 
 /* =========================
-   EDGE TYPE NORMALIZATION
+   MODE CONFIG (direction → csv, algo)
    ========================= */
-function normalizeEdgeType(raw) {
-  if (!raw) return { type: null, abbr: null };
-  const s = String(raw).toLowerCase().trim();
+const MODE_CFG = {
+  downstream: { direction: 'downstream', algo: 'DFS', csv: 'AI-SCG-Forward-Analysis.csv' },
+  upstream:   { direction: 'upstream',   algo: 'BFS', csv: 'AI-SCG-Backward-Analysis.csv' }
+};
 
-  // common cleanups
-  const t = s.replace(/[_-]/g, '').replace(/\s+/g, '');
-
-  // Quantization
-  if (s.includes('quant') || s.includes('gguf')) return { type: 'quantized', abbr: 'QN' };
-
-  // Merge
-  if (s.includes('merge')) return { type: 'merge', abbr: 'MR' };
-
-  // Adapter/LoRA
-  if (s.includes('adapter') || s.includes('adapters') || s.includes('lora') || s.includes('qlora')) {
-    return { type: 'adapter', abbr: 'AD' };
-  }
-
-  // Finetune variants
-  if (s.includes('finetune') || s.includes('fine-tune') || s.includes('fine tune') ||
-      t.includes('finetuned') || s === 'sft' || s.includes('sft') || s === 'dpo') {
-    return { type: 'finetune', abbr: 'FT' };
-  }
-
-  // Fallback: unknown
-  return { type: null, abbr: null };
-}
+/* =========================
+   TYPEAHEAD CONFIG
+   ========================= */
+const MODEL_CACHE = new Map();     // csv -> array of models
+const MIN_CHARS = 2;               // start suggesting
+const MAX_SUGGESTIONS = 50;        // keep DOM light
+let debTimer = null;
 
 /* =========================
    BOOT
@@ -72,136 +52,197 @@ function normalizeEdgeType(raw) {
 window.addEventListener('load', async () => {
   try {
     showStatus('Loading…', '');
-    await loadStartNodes('AI-SCG-Forward-Analysis.csv', 'base_model');
+
+    // Wire visible Algorithm to hidden Direction + load models
+    const algoSel = document.getElementById('algorithm');
+    const dirSel  = document.getElementById('direction');
+    const typeInput = document.getElementById('startNodeTypeahead');
+
+    const syncAlgoToDirection = () => {
+      const val = (algoSel?.value || 'DFS').toUpperCase();
+      const dir = (val === 'DFS') ? 'downstream' : 'upstream';
+      if (dirSel) dirSel.value = dir;
+      window.lastDirection = dir;
+      applyModeFromDirection(); // loads the proper CSV and clears selection
+    };
+
+    algoSel?.addEventListener('change', syncAlgoToDirection);
+    dirSel?.addEventListener('change', applyModeFromDirection); // still supported
+
+    // Typeahead events
+    typeInput?.addEventListener('input', () => {
+      clearTimeout(debTimer);
+      debTimer = setTimeout(updateTypeaheadSuggestions, 120);
+    });
+    typeInput?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); useSelectedStartNode(); }
+    });
+
+    // Apply once at startup (from current #algorithm value)
+    syncAlgoToDirection();
+
+    // Disable Graphviz layout control (we use D3 / Sigma)
     const layoutSel = document.getElementById('layout');
     if (layoutSel) layoutSel.disabled = true;
+
     initWorker();
-    showStatus('Ready — enter a file path and model to begin', 'success');
+    showStatus('Ready — select a model and click Run Traversal', 'success');
   } catch (e) {
     console.error(e);
-    showStatus(`Init error: ${e.message}`, 'error');
+    showStatus('Init error: ' + e.message, 'error');
   }
 });
 
 /* =========================
-   START NODE LIST (29k safe)
+   MODE/APPLY: set algo + csv, load model list
    ========================= */
-async function loadStartNodes(csvPath, column = 'base_model') {
-  if (!d3 || !d3.csv) { showStatus('d3.csv is not available', 'error'); return; }
-  const data = await d3.csv((csvPath || '').trim());
-  const normalized = data.map(row => {
-    const out = {};
-    for (const k in row) out[k.trim().toLowerCase()] = (row[k] ?? '').trim();
-    return out;
-  });
-  const colKey = Object.keys(normalized[0] || {}).find(k => k === String(column).toLowerCase()) || String(column).toLowerCase();
-
-  const uniq = new Set(); for (const r of normalized) { const v = (r[colKey] || ''); if (v) uniq.add(v); }
-  MODEL_CHOICES = Array.from(uniq).sort((a,b)=>a.localeCompare(b));
-  const MODEL_CHOICES_LC = MODEL_CHOICES.map(s => s.toLowerCase());
-
-  const inputTA = document.getElementById('startNodeTypeahead');
-  const dataList = document.getElementById('modelOptions');
-  if (inputTA && dataList) {
-    clearOptions(dataList);
-    const onInput = debounce(() => {
-      const q = (inputTA.value || '').toLowerCase();
-      if (q.length < DL_MIN_CHARS) { clearOptions(dataList); return; }
-      const matches = [];
-      for (let i=0; i<MODEL_CHOICES_LC.length; i++) {
-        if (MODEL_CHOICES_LC[i].includes(q)) {
-          matches.push(MODEL_CHOICES[i]);
-          if (matches.length >= DL_MAX_SUGGESTIONS) break;
-        }
-      }
-      renderOptionsChunked(dataList, matches, DL_CHUNK);
-    }, 120);
-    inputTA.addEventListener('input', onInput);
-    inputTA.addEventListener('keydown', (e) => { if (e.key === 'Enter') { copySelectedModelToStartField(); e.preventDefault(); }});
-  }
-  showStatus(`Loaded ${MODEL_CHOICES.length} models from CSV`, 'success');
+function readDirectionValue() {
+  const raw = (document.getElementById('direction')?.value || 'downstream').toLowerCase();
+  if (raw === 'downstream' || raw.includes('down')) return 'downstream';
+  if (raw === 'upstream'   || raw.includes('up'))   return 'upstream';
+  return 'downstream';
 }
-function useSelectedStartNode(){ copySelectedModelToStartField(); }
-function copySelectedModelToStartField(){
+
+async function applyModeFromDirection() {
+  const dir = readDirectionValue();
+  const cfg = MODE_CFG[dir] || MODE_CFG.downstream;
+
+  // Keep visible Algorithm select in sync (for clarity)
+  const algoSel = document.getElementById('algorithm');
+  if (algoSel) algoSel.value = cfg.algo;
+
+  // Clear current selection & suggestions
+  const typeInput = document.getElementById('startNodeTypeahead');
   const startField = document.getElementById('startNode');
-  const ta = document.getElementById('startNodeTypeahead');
-  const chosen = (ta?.value || '').trim();
-  if (!chosen) return showStatus('Type or choose a model first.', 'error');
-  startField.value = chosen; showStatus('Model copied. Click Run Traversal.', 'success');
+  const datalist = document.getElementById('modelOptions');
+  if (typeInput) typeInput.value = '';
+  if (startField) startField.value = '';
+  if (datalist) datalist.innerHTML = '';
+
+  window.lastDirection = cfg.direction;
+
+  // Load model list (cached)
+  await ensureModelListLoaded(cfg.csv);
+}
+
+/* =========================
+   TYPEAHEAD: models loading + suggestions
+   ========================= */
+async function ensureModelListLoaded(csvPath) {
+  if (MODEL_CACHE.has(csvPath)) return;
+
+  if (!window.d3 || !d3.csv) {
+    showStatus('d3.csv is not available', 'error');
+    return;
+  }
+
+  try {
+    const rows = await d3.csv((csvPath || '').trim());
+    const models = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const norm = {};
+      for (const k in row) norm[k.trim().toLowerCase()] = (row[k] ?? '').trim();
+      const v = norm['model'] || '';
+      if (v && !seen.has(v)) { seen.add(v); models.push(v); }
+    }
+    models.sort((a,b) => a.localeCompare(b));
+    MODEL_CACHE.set(csvPath, models);
+    showStatus('Loaded ' + models.length + ' models from CSV', 'success');
+  } catch (e) {
+    console.error(e);
+    showStatus('Error loading model list: ' + e.message, 'error');
+  }
+}
+
+function currentModelList() {
+  const dir = readDirectionValue();
+  const csv = (MODE_CFG[dir] || MODE_CFG.downstream).csv;
+  return MODEL_CACHE.get(csv) || [];
+}
+
+function updateTypeaheadSuggestions() {
+  const q = (document.getElementById('startNodeTypeahead')?.value || '').trim();
+  const datalist = document.getElementById('modelOptions');
+  if (!datalist) return;
+
+  datalist.innerHTML = '';
+  if (q.length < MIN_CHARS) return;
+
+  const needle = q.toLowerCase();
+  const models = currentModelList();
+
+  // priority: startsWith → then includes; stop scanning early
+  const starts = [];
+  const contains = [];
+  for (let i = 0; i < models.length; i++) {
+    const m = models[i];
+    const L = m.toLowerCase();
+    if (L.startsWith(needle)) starts.push(m);
+    else if (L.includes(needle)) contains.push(m);
+    if (starts.length + contains.length >= 1000) break;
+  }
+  const results = starts.concat(contains).slice(0, MAX_SUGGESTIONS);
+
+  const frag = document.createDocumentFragment();
+  for (const s of results) {
+    const opt = document.createElement('option');
+    opt.value = s;
+    frag.appendChild(opt);
+  }
+  datalist.appendChild(frag);
+}
+
+/* =========================
+   PUBLIC UI ACTIONS
+   ========================= */
+function useSelectedStartNode() {
+  const input = document.getElementById('startNodeTypeahead');
+  const startField = document.getElementById('startNode');
+  if (!input || !startField) return;
+
+  const val = (input.value || '').trim();
+  if (!val) {
+    showStatus('Type a few characters and choose a model.', 'error');
+    return;
+  }
+  startField.value = val;
+  showStatus('Selected model: ' + val + '. Click Run Traversal.', 'success');
 }
 window.useSelectedStartNode = useSelectedStartNode;
 
-function clearOptions(dl){ if (dl) dl.innerHTML = ''; }
-function renderOptionsChunked(dl, arr, chunkSize=100){
-  if (!dl) return; dl.innerHTML = ''; let i=0;
-  function appendChunk(){
-    const frag = document.createDocumentFragment();
-    const end = Math.min(i + chunkSize, arr.length);
-    for (; i<end; i++){ const opt = document.createElement('option'); opt.value = arr[i]; frag.appendChild(opt); }
-    dl.appendChild(frag);
-    if (i < arr.length) requestAnimationFrame(appendChunk);
-  }
-  requestAnimationFrame(appendChunk);
-}
-function debounce(fn, ms){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), ms); }; }
-
-/* =========================
-   WEB WORKER
-   ========================= */
-function initWorker() {
-  if (worker) try { worker.terminate(); } catch {}
-  const blob = new Blob([WORKER_SOURCE], { type: 'application/javascript' });
-  worker = new Worker(URL.createObjectURL(blob));
-  worker.onmessage = (ev) => {
-    const msg = ev.data || {};
-    if (msg.type === 'progress') {
-      if (msg.phase === 'fetch') showStatus('Loading graph file…', '');
-      else if (msg.phase === 'parse') showStatus(`Parsing DOT… ${msg.lines||0} lines`, '');
-      else if (msg.phase === 'traverse') showStatus(`Traversing (${msg.algorithm})…`, '');
-      else if (msg.phase === 'prep') showStatus('Preparing visualization…', '');
-    } else if (msg.type === 'result') {
-      if (msg.runId !== currentRunId) return; // stale
-      // Update globals for Stats feature
-      fullGraph = msg.fullGraph; reverseGraph = msg.reverseGraph; nodeLabelsGlobal = msg.labels; dotFileLines = msg.dotLines;
-      window.fullGraph = fullGraph; window.reverseGraph = reverseGraph; window.nodeLabelsGlobal = nodeLabelsGlobal;
-
-      // Update DOT textarea
-      const outTa = document.getElementById('dotOutput'); if (outTa) outTa.value = msg.dot;
-
-      // Render
-      renderGraph({ nodes: msg.nodes, edges: msg.edges, maxLevel: msg.maxLevel })
-        .then(() => {
-          const caption = (msg.direction === 'downstream') ? 'Forward subgraph analysis complete' : 'Backward subgraph analysis complete';
-          showStatus(`${caption}: ${msg.nodes.length} nodes, ${msg.edges.length} edges, ${msg.maxLevel + 1} levels`, 'success');
-        })
-        .catch(e => showStatus(`Render error: ${e.message}`, 'error'));
-    } else if (msg.type === 'error') {
-      if (msg.runId !== currentRunId) return;
-      showStatus(`Error: ${msg.message}`, 'error');
-    }
-  };
-}
-
-/* =========================
-   MAIN ACTIONS
-   ========================= */
 async function performTraversal() {
-  const startNode = (document.getElementById('startNode')?.value || '').trim();
-  const algorithm = (document.getElementById('algorithm')?.value || 'DFS').trim();
+  // Use hidden field; if empty, allow raw input value
+  let startNode = (document.getElementById('startNode')?.value || '').trim();
+  if (!startNode) {
+    const raw = (document.getElementById('startNodeTypeahead')?.value || '').trim();
+    if (raw) startNode = raw;
+  }
+
   let maxDepth = parseInt(document.getElementById('maxDepth')?.value ?? '5', 10);
-  const direction = (document.getElementById('direction')?.value || 'downstream').trim();
+  const direction = readDirectionValue();
   const filePath = (document.getElementById('filePath')?.value || '').trim();
 
-  if (!startNode) return showStatus('Please enter a valid start node.', 'error');
+  if (!startNode) return showStatus('Please pick a model from the list.', 'error');
   if (!filePath)  return showStatus('Please enter a valid file path.', 'error');
-  if (!Number.isFinite(maxDepth) || maxDepth < 1) maxDepth = 1; if (maxDepth > 50) maxDepth = 50;
+  if (!Number.isFinite(maxDepth) || maxDepth < 1) maxDepth = 1;
+  if (maxDepth > 50) maxDepth = 50;
 
-  const fileURL = toAbsoluteURL(filePath); // Live Server fix
+  // algorithm derives from direction
+  const algorithm = MODE_CFG[direction]?.algo || 'DFS';
+
+  // Keep visible select in sync
+  const algoSel = document.getElementById('algorithm');
+  if (algoSel) algoSel.value = algorithm;
+
+  const fileURL = toAbsoluteURL(filePath);
 
   // cancel previous
   currentRunId++;
   initWorker();
   showStatus('Loading graph file…', '');
+
+  window.lastDirection = direction;
 
   worker.postMessage({
     type: 'traverse',
@@ -212,17 +253,19 @@ async function performTraversal() {
 }
 window.performTraversal = performTraversal;
 
+/* Optional: load full graph into the right panel (unchanged) */
 async function loadFullGraph() {
   try {
     showStatus('Loading full graph…', '');
-    const fp = document.getElementById('filePath').value.trim(); if (!fp) return showStatus('Please enter a valid file path.', 'error');
+    const fp = document.getElementById('filePath')?.value?.trim();
+    if (!fp) return showStatus('Please enter a valid file path.', 'error');
     const abs = toAbsoluteURL(fp);
-    const res = await fetch(abs); if (!res.ok) throw new Error(`Failed to load ${abs}: ${res.status}`);
+    const res = await fetch(abs); if (!res.ok) throw new Error('Failed to load ' + abs + ': ' + res.status);
     const dotText = await res.text();
-    document.getElementById('dotOutput').value = dotText;
+    const out = document.getElementById('dotOutput'); if (out) out.value = dotText;
     await renderGraph(dotText);
     showStatus('Full graph loaded successfully', 'success');
-  } catch (e) { console.error(e); showStatus(`Error loading full graph: ${e.message}`, 'error'); }
+  } catch (e) { console.error(e); showStatus('Error loading full graph: ' + e.message, 'error'); }
 }
 window.loadFullGraph = loadFullGraph;
 
@@ -232,13 +275,52 @@ function toAbsoluteURL(p) {
 }
 
 /* =========================
+   WEB WORKER
+   ========================= */
+function initWorker() {
+  if (worker) { try { worker.terminate(); } catch {} }
+  const blob = new Blob([WORKER_SOURCE], { type: 'application/javascript' });
+  worker = new Worker(URL.createObjectURL(blob));
+  worker.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'progress') {
+      if (msg.phase === 'fetch') showStatus('Loading graph file…', '');
+      else if (msg.phase === 'parse') showStatus('Parsing DOT… ' + (msg.lines||0) + ' lines', '');
+      else if (msg.phase === 'traverse') showStatus('Traversing (' + msg.algorithm + ')…', '');
+      else if (msg.phase === 'prep') showStatus('Preparing visualization…', '');
+    } else if (msg.type === 'result') {
+      if (msg.runId !== currentRunId) return; // stale
+      fullGraph = msg.fullGraph; reverseGraph = msg.reverseGraph; nodeLabelsGlobal = msg.labels; dotFileLines = msg.dotLines;
+      window.fullGraph = fullGraph; window.reverseGraph = reverseGraph; window.nodeLabelsGlobal = nodeLabelsGlobal;
+
+      const outTa = document.getElementById('dotOutput');
+      if (outTa) outTa.value = msg.dot;
+
+      renderGraph({ nodes: msg.nodes, edges: msg.edges, maxLevel: msg.maxLevel })
+        .then(() => {
+          const caption = (msg.direction === 'downstream') ? 'Forward subgraph analysis complete' : 'Backward subgraph analysis complete';
+          showStatus(caption + ': ' + msg.nodes.length + ' nodes, ' + msg.edges.length + ' edges, ' + (msg.maxLevel + 1) + ' levels', 'success');
+        })
+        .catch(e => showStatus('Render error: ' + e.message, 'error'));
+    } else if (msg.type === 'error') {
+      if (msg.runId !== currentRunId) return;
+      showStatus('Error: ' + msg.message, 'error');
+    }
+  };
+}
+
+/* =========================
    RENDERING (chooser)
    ========================= */
 async function renderGraph(input) {
   const container = document.getElementById('graphviz-container');
+
+  // Reset scroll
+  try { container.scrollTop = 0; container.scrollLeft = 0; } catch {}
+
   try { if (__sigmaRenderer && typeof __sigmaRenderer.kill === 'function') __sigmaRenderer.kill(); } catch {}
   __sigmaRenderer = null;
-  if (__d3Cleanup) { try { __d3Cleanup(); } catch {}; __d3Cleanup = null; }
+  if (__d3Cleanup) { try { __d3Cleanup(); } catch {} ; __d3Cleanup = null; }
   container.innerHTML = '';
 
   if (typeof input === 'string') {
@@ -266,12 +348,32 @@ function countDotNodesEdges(dotContent) {
 }
 
 /* =========================
-   DOT→nodes/edges (self-loop safe, types)
+   DOT helpers & parse
    ========================= */
+const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
+
+function normalizeEdgeType(raw) {
+  if (!raw) return { ...DEFAULT_EDGE_TYPE };
+  const s = String(raw).toLowerCase().trim();
+  const t = s.replace(/[_-]/g, '').replace(/\s+/g, '');
+
+  if (s.includes('quant') || s.includes('gguf')) return { type: 'quantized', abbr: 'QN' };
+  if (s.includes('merge')) return { type: 'merge', abbr: 'MR' };
+  if (s.includes('adapter') || s.includes('adapters') || s.includes('lora') || s.includes('qlora')) {
+    return { type: 'adapter', abbr: 'AD' };
+  }
+  if (s.includes('finetune') || s.includes('fine-tune') || s.includes('fine tune') ||
+      t.includes('finetuned') || s === 'sft' || s.includes('sft') || s === 'dpo') {
+    return { type: 'finetune', abbr: 'FT' };
+  }
+  return { ...DEFAULT_EDGE_TYPE };
+}
+
 function parseNodesEdgesFromDot(dotContent) {
   const lines = dotContent.split('\n'); const nodes = []; const edges = [];
   for (const raw of lines) {
     const line = raw.trim();
+
     // Node with label including level
     const nodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+?)\\nLevel:\s*(\d+)(?:\\nSteps:\s*(\d+))?(?:\\n\[(?:BASE|TERMINAL)\])?".*\]/);
     if (nodeMatch) {
@@ -279,11 +381,13 @@ function parseNodesEdgesFromDot(dotContent) {
       const level = parseInt(nodeMatch[3],10)||0; const isBase = line.includes('[BASE]'); const isTerminal = line.includes('[TERMINAL]');
       nodes.push({ id, display:label, level, isExtreme:isBase||isTerminal }); continue;
     }
+
     const simpleNodeMatch = line.match(/"([^"]+)"\s*\[.*label="([^"\\]+?)\\nLevel:\s*(\d+)".*\]/);
     if (simpleNodeMatch) {
       const id = unquote(simpleNodeMatch[1]); const label = simpleNodeMatch[2]; const level = parseInt(simpleNodeMatch[3],10)||0;
       nodes.push({ id, display:label, level, isExtreme:false }); continue;
     }
+
     // Generic node (no level info)
     const plainNodeMatch = line.match(/^"([^"]+)"\s*\[.*\]/);
     if (plainNodeMatch && !line.includes('->')) {
@@ -298,10 +402,9 @@ function parseNodesEdgesFromDot(dotContent) {
       const s = unquote(edgeMatch[1]);
       const t = unquote(edgeMatch[2]);
       if (s === t) continue; // skip self-loop
-      let etypeRaw = null;
       const attrs = edgeMatch[3] || '';
       const lm = attrs.match(/label\s*=\s*"([^"]*)"/i);
-      if (lm) etypeRaw = lm[1];
+      const etypeRaw = lm ? lm[1] : null;
       const norm = normalizeEdgeType(etypeRaw);
       edges.push({ source: s, target: t, etype: norm.type, etypeAbbr: norm.abbr });
     }
@@ -318,7 +421,7 @@ function dedupeEdges(edges) {
   const seen = new Set(), out = [];
   for (const e of edges) {
     if (e.from === e.to) continue;
-    const key = `${e.from}->${e.to}`;
+    const key = e.from + '->' + e.to;
     if (seen.has(key)) continue;
     seen.add(key); out.push(e);
   }
@@ -326,15 +429,98 @@ function dedupeEdges(edges) {
 }
 
 /* =========================
-   D3 (SMALL GRAPHS) with edge labels
+   LEGEND (compact bar)
+   ========================= */
+function injectBottomLegendBar(container, redMeaning) {
+  container.querySelectorAll('.legend-footer').forEach(el => el.remove());
+
+  const foot = document.createElement('div');
+  foot.className = 'legend-footer';
+  foot.setAttribute('role', 'note');
+  foot.style.cssText = [
+    'position:absolute; top:10px; left:10px;',
+    'display:flex; flex-direction:column; align-items:flex-start;',
+    'background:rgba(255,255,255,.96); border:1px solid #e1e5ec; border-radius:12px;',
+    'padding:10px 14px; box-shadow:0 4px 14px rgba(0,0,0,.06);',
+    'font:13px/1.4 system-ui, Arial, sans-serif; color:#2b2f36;'
+  ].join('');
+
+  // --- Row 1: chips with descriptions ---
+  const row1 = document.createElement('div');
+  row1.style.cssText = 'display:flex; gap:14px; flex-wrap:wrap; margin-bottom:6px;';
+
+  const chipWithLabel = (abbr, meaning) => {
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'display:inline-flex; align-items:center; gap:6px;';
+    const chip = document.createElement('span');
+    chip.textContent = abbr;
+    chip.style.cssText = [
+      'display:inline-flex; align-items:center; justify-content:center;',
+      'min-width:26px; height:20px; padding:0 8px;',
+      'border:1px solid #d0d6e2; border-radius:999px;',
+      'font-weight:600; font-size:12px;',
+      'background:#fff; color:#111;'
+    ].join('');
+    const txt = document.createElement('span');
+    txt.textContent = meaning;
+    txt.style.cssText = 'font-size:12.5px; color:#444;';
+    wrap.append(chip, txt);
+    return wrap;
+  };
+
+  row1.appendChild(chipWithLabel('Legends',''));
+  row1.appendChild(chipWithLabel('FT','Fine-tuned'));
+  row1.appendChild(chipWithLabel('AD','Adapter'));
+  row1.appendChild(chipWithLabel('QN','Quantization'));
+  row1.appendChild(chipWithLabel('MR','Merged'));
+
+  // --- Row 2: depth + red note ---
+  const row2 = document.createElement('div');
+  row2.style.cssText = 'display:flex; align-items:center; gap:12px; flex-wrap:wrap;';
+
+  const depthLabel = document.createElement('span');
+  depthLabel.textContent = 'Depth';
+  depthLabel.style.cssText = 'font-size:12.5px; color:#344050; font-weight:500;';
+
+  const grad = document.createElement('span');
+  grad.setAttribute('aria-hidden','true');
+  grad.style.cssText = [
+    'width:140px; height:12px; border-radius:6px;',
+    'background:linear-gradient(90deg,#440154,#482878,#3E4989,#31688E,#26828E,#1F9E89,#35B779,#6DCD59,#B4DE2C,#FDE725);',
+    'border:1px solid #d8dbe2;'
+  ].join('');
+
+  const redNote = document.createElement('span');
+  redNote.textContent = redMeaning;
+  redNote.style.cssText = 'color:#b3261e; font-size:12.5px; font-weight:500;';
+
+  row2.append(depthLabel, grad, redNote);
+
+  // Put it all together
+  foot.append(row1, row2);
+  container.appendChild(foot);
+
+  return () => { try { foot.remove(); } catch {} };
+}
+
+
+/* =========================
+   D3 (SMALL GRAPHS)
    ========================= */
 async function renderWithD3ForceSmall(nodes, edges, container) {
   const width = container.clientWidth || 1200;
   const height = Math.max(700, container.clientHeight || 700);
 
-  const svg = d3.select(container).append('svg').attr('width', width).attr('height', height).style('background', '#ffffff');
+  const svg = d3.select(container)
+    .append('svg')
+    .attr('width', width)
+    .attr('height', height)
+    .style('background', '#ffffff');
+
   const g = svg.append('g');
-  const zoom = d3.zoom().scaleExtent([0.1, 4]).on('zoom', (event)=> g.attr('transform', event.transform)); svg.call(zoom);
+
+  const zoom = d3.zoom().scaleExtent([0.1, 4]).on('zoom', (event)=> g.attr('transform', event.transform));
+  svg.call(zoom);
 
   const showNodeLabels = nodes.length <= MAX_SVG_LABEL_NODES;
   const useArrows = edges.length <= MAX_SVG_ARROW_EDGES;
@@ -359,18 +545,17 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
     .attr('stroke', '#999').attr('stroke-opacity', 0.7).attr('stroke-width', 1.8)
     .attr('marker-end', useArrows ? 'url(#arrowhead)' : null);
 
-  // Edge type text (midpoint)
   let edgeText = null;
   if (showEdgeText) {
     edgeText = g.append('g').selectAll('text.edgelabel')
-      .data(edges.filter(e => e.etypeAbbr))
+      .data(edges)
       .enter().append('text')
         .attr('class', 'edgelabel')
         .attr('font-size', '9px')
         .attr('font-family', 'Arial, sans-serif')
         .attr('fill', '#444')
         .attr('text-anchor', 'middle')
-        .text(d => d.etypeAbbr);
+        .text(d => (d.etypeAbbr || DEFAULT_EDGE_TYPE.abbr));
   }
 
   const maxLevel = Math.max(0, ...nodes.map(d => d.level || 0));
@@ -393,7 +578,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
       .style('pointer-events', 'none');
 
     levelLabels = g.append('g').selectAll('text.level').data(nodes).enter().append('text')
-      .attr('class', 'level').text(d => `L${d.level || 0}`)
+      .attr('class', 'level').text(d => 'L' + (d.level || 0))
       .attr('font-size', '8px').attr('font-family', 'Arial, sans-serif')
       .attr('text-anchor', 'middle').attr('dy', 4).attr('fill', '#fff')
       .attr('font-weight', 'bold').style('pointer-events', 'none');
@@ -405,7 +590,7 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
   container.appendChild(tip);
 
   node.on('mouseover', function (event, d) {
-      tip.textContent = `${d.display || d.id} (Level ${d.level || 0})`;
+      tip.textContent = (d.display || d.id) + ' (Level ' + (d.level || 0) + ')';
       tip.style.left = (event.offsetX + 12) + 'px';
       tip.style.top  = (event.offsetY - 10) + 'px';
       tip.style.display = 'block';
@@ -447,18 +632,20 @@ async function renderWithD3ForceSmall(nodes, edges, container) {
     .on('drag',  (event, d) => { d.fx = event.x; d.fy = event.y; })
     .on('end',   (event, d) => { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
 
-  const helper = document.createElement('div');
-  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
-  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br>• Drag nodes: move<br><br><strong>Legend:</strong><br>• Color = depth level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
-  container.appendChild(helper);
+  const redMeaning = (window.lastDirection === 'downstream')
+    ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  const removeLegend = injectBottomLegendBar(container, redMeaning);
 
-  __d3Cleanup = () => { try { simulation.stop(); } catch {}; try { svg.remove(); } catch {}; try { tip.remove(); } catch {}; try { helper.remove(); } catch {}; };
+  __d3Cleanup = () => {
+    try { simulation.stop(); } catch {}
+    try { svg.remove(); } catch {}
+    try { tip.remove(); } catch {}
+    try { removeLegend(); } catch {}
+  };
 }
 
 /* =========================
-   SIGMA (BIG GRAPHS)
-   - hover tooltip shows edge type
+   SIGMA (BIG GRAPHS) — now with edge labels
    ========================= */
 async function renderWithSigmaLayered(nodes, edges, container) {
   await loadScriptOnce('https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js', () => !!window.graphology);
@@ -470,7 +657,11 @@ async function renderWithSigmaLayered(nodes, edges, container) {
 
   const rect = container.getBoundingClientRect(); const width = rect.width || 1200; const height = Math.max(700, rect.height || 700);
   const levels = new Map(); let maxLevel = 0;
-  for (const n of nodes) { const l = n.level||0; maxLevel=Math.max(maxLevel,l); (levels.get(l) || levels.set(l, []).get(l)).push?.(n) || levels.get(l).push(n); }
+  for (const n of nodes) {
+    const l = n.level||0; maxLevel=Math.max(maxLevel,l);
+    if (!levels.has(l)) levels.set(l, []);
+    levels.get(l).push(n);
+  }
 
   const topPad=80, bottomPad=60, leftPad=80, rightPad=60;
   const rows = Math.max(1, maxLevel + 1);
@@ -481,7 +672,6 @@ async function renderWithSigmaLayered(nodes, edges, container) {
   const colorFor = lvl => palette[lvl % palette.length];
   const trunc = (s, n=24) => (s||'').length>n ? (s||'').slice(0,n-1)+'…' : (s||'');
 
-  // Add nodes in chunks
   for (const [lvl, arr] of levels.entries()) {
     let i = 0; const span = Math.max(1, arr.length - 1);
     while (i < arr.length) {
@@ -502,7 +692,6 @@ async function renderWithSigmaLayered(nodes, edges, container) {
     }
   }
 
-  // Edges in chunks
   let ei = 0;
   while (ei < edges.length) {
     const end = Math.min(ei + 4000, edges.length);
@@ -510,43 +699,46 @@ async function renderWithSigmaLayered(nodes, edges, container) {
       const e = edges[ei];
       const from = e.source || e.from;
       const to   = e.target || e.to;
-      if (from === to) continue; // skip self-loop
+      if (from === to) continue;
       if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from, to)) {
-        try { graph.addEdge(from, to, {
-          size: 1,
-          etype: e.etype || null,
-          etypeAbbr: e.etypeAbbr || null
-        }); } catch {}
+        try {
+          graph.addEdge(from, to, {
+            size: 1,
+            // important: expose label for Sigma to render
+            label: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr,
+            etype: e.etype || DEFAULT_EDGE_TYPE.type,
+            etypeAbbr: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr
+          });
+        } catch {}
       }
     }
     await new Promise(r=>setTimeout(r,0));
   }
 
-  // Sigma renderer with label threshold (labels only when zoomed in)
   container.innerHTML = '';
   __sigmaRenderer = new SigmaCtor(graph, container, {
     renderLabels: true,
     labelRenderedSizeThreshold: 12,
-    enableEdgeHoverEvents: true
+    enableEdgeHoverEvents: true,
+    // NEW: draw edge labels too
+    renderEdgeLabels: true,
+    edgeLabelRenderedSizeThreshold: 8
   });
 
-  // Hover tooltip (HTML overlay)
   const tip = document.createElement('div');
   tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
   container.appendChild(tip);
 
   __sigmaRenderer.on('enterNode', ({ node }) => {
     const attrs = graph.getNodeAttributes(node);
-    tip.textContent = `${attrs.label || node} (Level ${attrs.level || 0})`;
+    tip.textContent = (attrs.label || node) + ' (Level ' + (attrs.level || 0) + ')';
     tip.style.display = 'block';
   });
   __sigmaRenderer.on('leaveNode', () => { tip.style.display = 'none'; });
 
-  // Edge hover: show type
   __sigmaRenderer.on('enterEdge', ({ edge }) => {
     const a = graph.getEdgeAttributes(edge);
-    const msg = a.etypeAbbr ? `Edge type: ${a.etypeAbbr}` : 'Edge';
-    tip.textContent = msg;
+    tip.textContent = 'Edge type: ' + (a.etypeAbbr || DEFAULT_EDGE_TYPE.abbr);
     tip.style.display = 'block';
   });
   __sigmaRenderer.on('leaveEdge', () => { tip.style.display = 'none'; });
@@ -557,22 +749,26 @@ async function renderWithSigmaLayered(nodes, edges, container) {
     tip.style.top  = (e.y - rect2.top  - 10) + 'px';
   });
 
-  // Controls & legend overlay
-  const helper = document.createElement('div');
-  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
-  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
-  container.appendChild(helper);
+  const redMeaning = (window.lastDirection === 'downstream')
+    ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  injectBottomLegendBar(container, redMeaning);
 }
 
 async function renderWithSigmaFastFromDot(dotContent, container) {
   await loadScriptOnce('https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js', () => !!window.graphology);
   await loadScriptOnce('https://unpkg.com/sigma@2.4.0/build/sigma.min.js', () => !!window.Sigma || !!window.sigma);
-  const Graph = window.graphology?.Graph; const SigmaCtor = window.Sigma || window.sigma; if (!Graph || !SigmaCtor) throw new Error('Sigma/Graphology failed to load.');
-  const { nodes, edges } = parseNodesEdgesFromDot(dotContent); const graph = new Graph({ multi:false, allowSelfLoops:false });
+  const Graph = window.graphology?.Graph; const SigmaCtor = window.Sigma || window.sigma;
+  if (!Graph || !SigmaCtor) throw new Error('Sigma/Graphology failed to load.');
+  const { nodes, edges } = parseNodesEdgesFromDot(dotContent);
+  const graph = new Graph({ multi:false, allowSelfLoops:false });
 
   const rect = container.getBoundingClientRect(); const width = rect.width || 1200; const height = Math.max(700, rect.height || 700);
-  const levels = new Map(); let maxLevel = 0; nodes.forEach(n => { const l = n.level||0; maxLevel=Math.max(maxLevel,l); (levels.get(l) || levels.set(l, []).get(l)).push?.(n) || levels.get(l).push(n); });
+  const levels = new Map(); let maxLevel = 0;
+  nodes.forEach(n => {
+    const l = n.level||0; maxLevel=Math.max(maxLevel,l);
+    if (!levels.has(l)) levels.set(l, []);
+    levels.get(l).push(n);
+  });
   const topPad=80, bottomPad=60, leftPad=80, rightPad=60; const rows=Math.max(1,maxLevel+1);
   const levelGap=Math.max(90,(height-topPad-bottomPad)/rows); const rowY = l => topPad + l*levelGap;
   const palette = ['#440154','#482878','#3E4989','#31688E','#26828E','#1F9E89','#35B779','#6DCD59','#B4DE2C','#FDE725'];
@@ -599,7 +795,15 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
       const e = edges[ei]; const from = e.source || e.from; const to = e.target || e.to;
       if (from === to) continue;
       if (graph.hasNode(from) && graph.hasNode(to) && !graph.hasEdge(from,to)) {
-        try { graph.addEdge(from,to,{ size:1, etype: e.etype || null, etypeAbbr: e.etypeAbbr || null }); } catch {}
+        try {
+          graph.addEdge(from,to,{
+            size:1,
+            // important: expose label for Sigma to render
+            label: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr,
+            etype: e.etype || DEFAULT_EDGE_TYPE.type,
+            etypeAbbr: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr
+          });
+        } catch {}
       }
     }
     await new Promise(r=>setTimeout(r,0));
@@ -609,22 +813,24 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
   __sigmaRenderer = new SigmaCtor(graph, container, {
     renderLabels: true,
     labelRenderedSizeThreshold: 12,
-    enableEdgeHoverEvents: true
+    enableEdgeHoverEvents: true,
+    // NEW: draw edge labels too
+    renderEdgeLabels: true,
+    edgeLabelRenderedSizeThreshold: 8
   });
 
-  // Hover tooltip + overlay
   const tip = document.createElement('div');
   tip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(255,255,255,.96);border:1px solid #ccc;padding:6px 8px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:12px;color:#111;display:none;';
   container.appendChild(tip);
   __sigmaRenderer.on('enterNode', ({ node }) => {
     const attrs = graph.getNodeAttributes(node);
-    tip.textContent = `${attrs.label || node} (Level ${attrs.level || 0})`;
+    tip.textContent = (attrs.label || node) + ' (Level ' + (attrs.level || 0) + ')';
     tip.style.display = 'block';
   });
   __sigmaRenderer.on('leaveNode', () => { tip.style.display = 'none'; });
   __sigmaRenderer.on('enterEdge', ({ edge }) => {
     const a = graph.getEdgeAttributes(edge);
-    tip.textContent = a.etypeAbbr ? `Edge type: ${a.etypeAbbr}` : 'Edge';
+    tip.textContent = 'Edge type: ' + (a.etypeAbbr || DEFAULT_EDGE_TYPE.abbr);
     tip.style.display = 'block';
   });
   __sigmaRenderer.on('leaveEdge', () => { tip.style.display = 'none'; });
@@ -634,56 +840,10 @@ async function renderWithSigmaFastFromDot(dotContent, container) {
     tip.style.top  = (e.y - rect2.top  - 10) + 'px';
   });
 
-  const helper = document.createElement('div');
-  helper.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,255,255,.92);padding:10px;border-radius:6px;font:12px/16px system-ui,Arial;pointer-events:none;border:1px solid #ddd;';
-  const redMeaning = (window.lastDirection === 'downstream') ? 'Red border: Terminal nodes' : 'Red border: Base models';
-  helper.innerHTML = `<strong>Controls:</strong><br>• Zoom: wheel/pinch<br>• Pan: drag background<br><br><strong>Legend:</strong><br>• Rows = level<br>• Color = level<br>• ${redMeaning}<br>• Level 0 = Start node<br>• Edge types: <code>FT</code>=Finetune, <code>AD</code>=Adapter, <code>QN</code>=Quantized, <code>MR</code>=Merge`;
-  container.appendChild(helper);
+  const redMeaning = (window.lastDirection === 'downstream')
+    ? 'Red border: Terminal nodes' : 'Red border: Base models';
+  injectBottomLegendBar(container, redMeaning);
 }
-
-// /* =========================
-//    DOT helpers + UI helpers
-//    ========================= */
-// const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
-
-// function showStatus(message, type) {
-//   // Provided by ui.js too; keep a safe local if needed
-//   const el = document.getElementById('status');
-//   if (!el) return;
-//   el.textContent = message;
-//   el.className = `status ${type||''}`;
-//   el.style.display = message ? 'block' : 'none';
-// }
-// function clearResults(){
-//   const c = document.getElementById('graphviz-container');
-//   c.innerHTML = '<div style="text-align:center; padding:50px; color:#666;">Enter a model and run traversal</div>';
-//   const out = document.getElementById('dotOutput'); if (out) out.value='';
-//   showStatus('Results cleared', 'success');
-// }
-// function showGraphStats(){
-//   const nodeCount = Object.keys(window.fullGraph||{}).length;
-//   const revCount = Object.keys(window.reverseGraph||{}).length;
-//   const edgeCount = Object.values(window.fullGraph||{}).reduce((s,n)=>s+(n?.length||0),0);
-//   alert(`Forward nodes: ${nodeCount}\nReverse nodes: ${revCount}\nEdges: ${edgeCount}`);
-// }
-// function copyDotFormat(){
-//   const ta = document.getElementById('dotOutput'); if (!ta || !ta.value) return showStatus('No content to copy', 'error');
-//   ta.select(); document.execCommand('copy'); showStatus('DOT copied to clipboard', 'success');
-// }
-// function downloadDotFile(){
-//   const text = document.getElementById('dotOutput')?.value || '';
-//   if (!text) return showStatus('No traversal results to download', 'error');
-//   const modelSafe = (document.getElementById('startNode')?.value || 'model').trim().replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,'_');
-//   const algo = document.getElementById('algorithm')?.value;
-//   const filename = (algo==='DFS') ? `Forward_analysis_of_${modelSafe}.dot` : `Backward_analysis_of_${modelSafe}.dot`;
-//   const blob = new Blob([text], { type:'text/plain' });
-//   const link = document.createElement('a'); link.download = filename; link.href = window.URL.createObjectURL(blob); link.click();
-//   window.URL.revokeObjectURL(link.href); showStatus(`Saved: ${filename}`, 'success');
-// }
-// window.clearResults = clearResults;
-// window.showGraphStats = showGraphStats;
-// window.copyDotFormat = copyDotFormat;
-// window.downloadDotFile = downloadDotFile;
 
 /* =========================
    UTIL: loadScriptOnce
@@ -701,309 +861,356 @@ function loadScriptOnce(src, checkFn){
       }
       const s = document.createElement('script'); s.src = src; s.async = true;
       s.onload = () => (typeof checkFn === 'function'
-          ? (checkFn() ? resolve() : setTimeout(() => checkFn() ? resolve() : reject(new Error(`Script loaded but check failed: ${src}`)), 50))
+          ? (checkFn() ? resolve() : setTimeout(() => checkFn() ? resolve() : reject(new Error('Script loaded but check failed: ' + src)), 50))
           : resolve());
-      s.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+      s.onerror = () => reject(new Error('Failed to load script: ' + src));
       document.head.appendChild(s);
     }catch(e){reject(e);}
   });
 }
 
 /* =========================
-   WORKER SOURCE (string)
-   - parses edge label => normalized etype + abbr
-   - carries etype into traversal edges
+   WORKER SOURCE
    ========================= */
 const WORKER_SOURCE = `
-  const unquote = (s) => String(s).replace(/^"(.*)"$/s, '$1');
-  const quoteId = (s) => \`"\${String(s).replace(/"/g, '\\\\"')}"\`;
-  const escLbl  = (s) => String(s).replace(/"/g, '\\\\"');
+  (function(){
+    'use strict';
 
-  function normalizeEdgeType(raw) {
-    if (!raw) return { type: null, abbr: null };
-    const s = String(raw).toLowerCase().trim();
-    const t = s.replace(/[_-]/g, '').replace(/\\s+/g, '');
-    if (s.includes('quant') || s.includes('gguf')) return { type: 'quantized', abbr: 'QN' };
-    if (s.includes('merge')) return { type: 'merge', abbr: 'MR' };
-    if (s.includes('adapter') || s.includes('adapters') || s.includes('lora') || s.includes('qlora')) return { type: 'adapter', abbr: 'AD' };
-    if (s.includes('finetune') || s.includes('fine-tune') || s.includes('fine tune') ||
-        t.includes('finetuned') || s === 'sft' || s.includes('sft') || s === 'dpo') return { type: 'finetune', abbr: 'FT' };
-    return { type: null, abbr: null };
-  }
+    var DEFAULT_EDGE_TYPE = { type: 'finetune', abbr: 'FT' };
 
-  self.onmessage = async (ev) => {
-    const msg = ev.data || {};
-    if (msg.type !== 'traverse') return;
-    const { runId, filePath, startNode, direction, algorithm, maxDepth } = msg;
-    try {
-      postMessage({ type: 'progress', phase: 'fetch', runId });
-      const res = await fetch(filePath);
-      if (!res.ok) throw new Error(\`Failed to load \${filePath}: \${res.status}\`);
+    function unquote(s){ return String(s).replace(/^(\"(.*)\")$/s, '$2'); }
+    function quoteId(s){ return '"' + String(s).replace(/"/g, '\\\\\\"') + '"'; }
+    function escLbl(s){  return String(s).replace(/"/g, '\\\\\\"'); }
 
-      // Stream + parse DOT
-      const { fullGraph, reverseGraph, labels, lines, edgeTypes } = await parseDotStream(res.body);
-      postMessage({ type: 'progress', phase: 'traverse', runId, algorithm });
-
-      // Resolve start
-      const graph = (direction === 'upstream') ? reverseGraph : fullGraph;
-      const actualStart = resolveStartNode(graph, startNode);
-      if (!actualStart) throw new Error(\`Start node "\${startNode}" not found\`);
-
-      // Traverse (edge types carried along)
-      const T = (algorithm === 'DFS')
-        ? traverseDFS(graph, actualStart, maxDepth, direction, edgeTypes)
-        : traverseBFS(graph, actualStart, maxDepth, direction, edgeTypes);
-
-      const maxLevel = Math.max(...T.levels.values());
-      const nodes = T.order.map(id => ({
-        id,
-        display: labels[id] || id,
-        level: T.levels.get(id) || 0,
-        isExtreme: (T.levels.get(id) || 0) === maxLevel
-      }));
-      // Dedup + convert to {source,target,etype,etypeAbbr}
-      const edges = dedupeEdges(T.edges).map(e => ({ source: e.from, target: e.to, etype: e.etype || null, etypeAbbr: e.etypeAbbr || null }));
-
-      // Build paths only for extremes (for DOT comments)
-      const extremes = []; for (const [n,l] of T.levels.entries()) if (l===maxLevel) extremes.push(n);
-      const paths = buildPathsFor(extremes, T.parent);
-
-      postMessage({ type: 'progress', phase: 'prep', runId });
-
-      const dot = generateTraversalDot(T.order, edges, algorithm, actualStart, direction, T.levels, paths, labels);
-
-      postMessage({
-        type: 'result', runId,
-        direction, maxLevel, nodes, edges,
-        dot, labels, dotLines: lines,
-        fullGraph, reverseGraph
-      });
-    } catch (e) {
-      postMessage({ type: 'error', runId, message: e.message || String(e) });
-    }
-  };
-
-  function resolveStartNode(graphObj, userInput) {
-    if (!userInput) return null; if (graphObj[userInput]) return userInput;
-    const q = userInput.toLowerCase();
-    const keys = Object.keys(graphObj);
-    let found = keys.find(k => k.toLowerCase() === q) ||
-                keys.find(k => k.toLowerCase().startsWith(q)) ||
-                keys.find(k => k.toLowerCase().includes(q));
-    if (found) return found;
-    for (const tgts of Object.values(graphObj)) {
-      if (tgts.includes(userInput)) { if (!graphObj[userInput]) graphObj[userInput] = []; return userInput; }
-    }
-    return null;
-  }
-
-  // Streaming DOT parser (line-by-line) – with self-loop filtering + edge types
-  async function parseDotStream(readable) {
-    const dec = new TextDecoder();
-    const full = {}, rev = {}, labels = {};
-    const lines = [];
-    const edgeTypes = {}; // key: "from->to" => { type, abbr }
-    let buf = '';
-    let lineCount = 0;
-
-    if (!readable) {
-      return { fullGraph: full, reverseGraph: rev, labels, lines: [], edgeTypes };
+    function normalizeEdgeType(raw) {
+      if (!raw) return { type: DEFAULT_EDGE_TYPE.type, abbr: DEFAULT_EDGE_TYPE.abbr };
+      var s = String(raw).toLowerCase().trim();
+      var t = s.replace(/[_-]/g, '').replace(/\\s+/g, '');
+      if (s.indexOf('quant') >= 0 || s.indexOf('gguf') >= 0) return { type: 'quantized', abbr: 'QN' };
+      if (s.indexOf('merge') >= 0) return { type: 'merge', abbr: 'MR' };
+      if (s.indexOf('adapter') >= 0 || s.indexOf('adapters') >= 0 || s.indexOf('lora') >= 0 || s.indexOf('qlora') >= 0) return { type: 'adapter', abbr: 'AD' };
+      if (s.indexOf('finetune') >= 0 || s.indexOf('fine-tune') >= 0 || s.indexOf('fine tune') >= 0 ||
+          t.indexOf('finetuned') >= 0 || s === 'sft' || s.indexOf('sft') >= 0 || s === 'dpo') return { type: 'finetune', abbr: 'FT' };
+      return { type: DEFAULT_EDGE_TYPE.type, abbr: DEFAULT_EDGE_TYPE.abbr };
     }
 
-    const reader = readable.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+    self.onmessage = function(ev){
+      var msg = ev.data || {};
+      if (msg.type !== 'traverse') return;
+      var runId = msg.runId, filePath = msg.filePath, startNode = msg.startNode, direction = msg.direction, algorithm = msg.algorithm, maxDepth = msg.maxDepth;
+      (async function(){
+        try{
+          postMessage({ type: 'progress', phase: 'fetch', runId: runId });
+          var res = await fetch(filePath);
+          if (!res.ok) throw new Error('Failed to load ' + filePath + ': ' + res.status);
 
-      let idx;
-      while ((idx = buf.indexOf('\\n')) >= 0) {
-        const raw = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        lines.push(raw);
-        processDotLine(raw, full, rev, labels, edgeTypes);
-        if ((++lineCount % 4000) === 0) postMessage({ type: 'progress', phase: 'parse', lines: lineCount });
+          // Stream + parse DOT
+          var parsed = await parseDotStream(res.body);
+          var fullGraph = parsed.fullGraph, reverseGraph = parsed.reverseGraph, labels = parsed.labels, lines = parsed.lines, edgeTypes = parsed.edgeTypes;
+          postMessage({ type: 'progress', phase: 'traverse', runId: runId, algorithm: algorithm });
+
+          // Resolve start
+          var graph = (direction === 'upstream') ? reverseGraph : fullGraph;
+          var actualStart = resolveStartNode(graph, startNode);
+          if (!actualStart) throw new Error('Start node "' + startNode + '" not found');
+
+          // Traverse (edge types carried along)
+          var T = (algorithm === 'DFS')
+            ? traverseDFS(graph, actualStart, maxDepth, direction, edgeTypes)
+            : traverseBFS(graph, actualStart, maxDepth, direction, edgeTypes);
+
+          var maxLevel = T.levels.size ? Math.max.apply(null, Array.from(T.levels.values())) : 0;
+          var nodes = T.order.map(function(id){
+            return {
+              id: id,
+              display: labels[id] || id,
+              level: T.levels.get(id) || 0,
+              isExtreme: (T.levels.get(id) || 0) === maxLevel
+            };
+          });
+
+          // --- FIX B: keep only edges whose endpoints are in the visited set ---
+          var keep = new Set(T.order);
+          var edges = dedupeEdges(T.edges)
+            .filter(function(e){ return keep.has(e.from) && keep.has(e.to); })
+            .map(function(e){
+              return {
+                source: e.from, target: e.to,
+                etype: e.etype || DEFAULT_EDGE_TYPE.type,
+                etypeAbbr: e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr,
+                level: e.level
+              };
+            });
+          // --- END FIX B ---
+
+          // Build paths only for extremes (for DOT comments)
+          var extremes = [];
+          T.levels.forEach(function(l, n){ if (l === maxLevel) extremes.push(n); });
+          var paths = buildPathsFor(extremes, T.parent);
+
+          postMessage({ type: 'progress', phase: 'prep', runId: runId });
+
+          var dot = generateTraversalDot(T.order, edges, algorithm, actualStart, direction, T.levels, paths, labels);
+
+          postMessage({
+            type: 'result', runId: runId,
+            direction: direction, maxLevel: maxLevel, nodes: nodes, edges: edges,
+            dot: dot, labels: labels, dotLines: lines,
+            fullGraph: fullGraph, reverseGraph: reverseGraph
+          });
+        }catch(e){
+          postMessage({ type: 'error', runId: runId, message: (e && e.message) ? e.message : String(e) });
+        }
+      })();
+    };
+
+    function resolveStartNode(graphObj, userInput) {
+      if (!userInput) return null; if (graphObj[userInput]) return userInput;
+      var q = String(userInput).toLowerCase();
+      var keys = Object.keys(graphObj);
+      var found = keys.find(function(k){ return k.toLowerCase() === q; }) ||
+                  keys.find(function(k){ return k.toLowerCase().indexOf(q) === 0; }) ||
+                  keys.find(function(k){ return k.toLowerCase().indexOf(q) >= 0; });
+      if (found) return found;
+      for (var k in graphObj) {
+        var tgts = graphObj[k] || [];
+        if (tgts.indexOf(userInput) >= 0) { if (!graphObj[userInput]) graphObj[userInput] = []; return userInput; }
       }
-    }
-    if (buf) { lines.push(buf); processDotLine(buf, full, rev, labels, edgeTypes); }
-    return { fullGraph: full, reverseGraph: rev, labels, lines, edgeTypes };
-  }
-
-  function processDotLine(raw, full, rev, labels, edgeTypes) {
-    const line = raw.trim();
-    if (!line || line === '{' || line === '}' || /^\\/\\//.test(line) || /^#/.test(line)) return;
-    if (/(^|\\s)(digraph|graph)(\\s|\\{)/.test(line)) return;
-
-    let m = line.match(/^"([^"]+)"\\s*\\[.*\\blabel="([^"]*)".*\\]/) ||
-            line.match(/^([\\w./-]+)\\s*\\[.*\\blabel="([^"]*)".*\\]/);
-    if (m && !line.includes('->')) {
-      const id = unquote(m[1]); const label = m[2];
-      if (labels[id] === undefined) labels[id] = label;
-      (full[id] ||= []); (rev[id] ||= []);
-      return;
+      return null;
     }
 
-    // Edge with optional attr block
-    m = line.match(/"([^"]+)"\\s*->\\s*"([^"]+)"(?:\\s*\\[(.*?)\\])?/);
-    if (m) {
-      const from = unquote(m[1]); const to = unquote(m[2]);
-      if (from === to) return; // skip self-loop
-      (full[from] ||= []).push(to); (full[to] ||= []);
-      (rev[to]   ||= []).push(from); (rev[from] ||= []);
+    // Streaming DOT parser (line-by-line)
+    async function parseDotStream(readable) {
+      var dec = new TextDecoder();
+      var full = {}, rev = {}, labels = {};
+      var lines = [];
+      var edgeTypes = {}; // key: "from->to" => { type, abbr }
+      var buf = '';
+      var lineCount = 0;
 
-      const attrs = m[3] || '';
-      const lm = attrs.match(/label\\s*=\\s*"([^"]*)"/i);
-      if (lm) {
-        const norm = normalizeEdgeType(lm[1]);
-        edgeTypes[\`\${from}->\${to}\`] = norm;
+      if (!readable) {
+        return { fullGraph: full, reverseGraph: rev, labels: labels, lines: [], edgeTypes: edgeTypes };
       }
-      return;
-    }
 
-    // Generic node without label
-    m = line.match(/^"([^"]+)"\\s*\\[/);
-    if (m && !line.includes('->')) {
-      const id = unquote(m[1]);
-      (full[id] ||= []); (rev[id] ||= []);
-    }
-  }
+      var reader = readable.getReader();
+      while (true) {
+        var step = await reader.read();
+        if (step.done) break;
+        buf += dec.decode(step.value, { stream: true });
 
-  // Traversals with self-loop guard + etype lookup
-  function traverseDFS(graphObj, start, maxDepth, direction, edgeTypes) {
-    const stack = [[start, 0]];
-    const visited = new Set();
-    const order = [];
-    const edges = [];
-    const levels = new Map([[start, 0]]);
-    const parent = new Map();
-
-    while (stack.length) {
-      const [node, depth] = stack.pop();
-      if (visited.has(node)) continue;
-      visited.add(node);
-      order.push(node);
-
-      const neighbors = graphObj[node] || [];
-      for (let i = neighbors.length - 1; i >= 0; i--) {
-        const nb = neighbors[i];
-        if (nb === node) continue;  // self-loop guard
-        const key = (direction==='upstream') ? \`\${nb}->\${node}\` : \`\${node}->\${nb}\`;
-        const norm = edgeTypes[key] || { type: null, abbr: null };
-        const edge = direction==='upstream'
-          ? {from:nb,to:node,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr}
-          : {from:node,to:nb,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr};
-        edges.push(edge);
-        if (!visited.has(nb) && depth + 1 <= maxDepth) {
-          if (!levels.has(nb)) levels.set(nb, depth + 1);
-          if (!parent.has(nb)) parent.set(nb, node);
-          stack.push([nb, depth + 1]);
+        var idx;
+        while ((idx = buf.indexOf('\\n')) >= 0) {
+          var raw = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          lines.push(raw);
+          processDotLine(raw, full, rev, labels, edgeTypes);
+          lineCount++;
+          if ((lineCount % 4000) === 0) postMessage({ type: 'progress', phase: 'parse', lines: lineCount });
         }
       }
+      if (buf) { lines.push(buf); processDotLine(buf, full, rev, labels, edgeTypes); }
+      return { fullGraph: full, reverseGraph: rev, labels: labels, lines: lines, edgeTypes: edgeTypes };
     }
-    return { order, edges, levels, parent };
-  }
 
-  function traverseBFS(graphObj, start, maxDepth, direction, edgeTypes) {
-    const queue = [[start, 0]];
-    let qi = 0;
-    const visited = new Set([start]);
-    const order = [];
-    const edges = [];
-    const levels = new Map([[start, 0]]);
-    const parent = new Map();
+    function processDotLine(raw, full, rev, labels, edgeTypes) {
+      var line = String(raw).trim();
+      if (!line || line === '{' || line === '}' || /^\\/\\//.test(line) || /^#/.test(line)) return;
+      if (/(^|\\s)(digraph|graph)(\\s|\\{)/.test(line)) return;
 
-    while (qi < queue.length) {
-      const [node, depth] = queue[qi++];
-      order.push(node);
-      const neighbors = graphObj[node] || [];
-      for (const nb of neighbors) {
-        if (nb === node) continue; // self-loop guard
-        const key = (direction==='upstream') ? \`\${nb}->\${node}\` : \`\${node}->\${nb}\`;
-        const norm = edgeTypes[key] || { type: null, abbr: null };
-        const edge = direction==='upstream'
-          ? {from:nb,to:node,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr}
-          : {from:node,to:nb,level:depth+1, etype:norm.type, etypeAbbr:norm.abbr};
-        edges.push(edge);
-        if (!visited.has(nb) && depth + 1 <= maxDepth) {
-          visited.add(nb);
-          levels.set(nb, depth + 1);
-          if (!parent.has(nb)) parent.set(nb, node);
-          queue.push([nb, depth + 1]);
-        }
+      var m = line.match(/^"([^"]+)"\\s*\\[.*\\blabel="([^"]*)".*\\]/) ||
+              line.match(/^([\\w./-]+)\\s*\\[.*\\blabel="([^"]*)".*\\]/);
+      if (m && line.indexOf('->') === -1) {
+        var id = unquote(m[1]); var label = m[2];
+        if (typeof labels[id] === 'undefined') labels[id] = label;
+        if (!full[id]) full[id] = []; if (!rev[id]) rev[id] = [];
+        return;
+      }
+
+      // Edge with optional attr block
+      m = line.match(/"([^"]+)"\\s*->\\s*"([^"]+)"(?:\\s*\\[(.*?)\\])?/);
+      if (m) {
+        var from = unquote(m[1]); var to = unquote(m[2]);
+        if (from === to) return; // skip self-loop
+        if (!full[from]) full[from] = []; full[from].push(to); if (!full[to]) full[to] = [];
+        if (!rev[to]) rev[to] = []; rev[to].push(from); if (!rev[from]) rev[from] = [];
+
+        var attrs = m[3] || '';
+        var lm = attrs.match(/label\\s*=\\s*"([^"]*)"/i);
+        var norm = lm ? normalizeEdgeType(lm[1]) : { type: DEFAULT_EDGE_TYPE.type, abbr: DEFAULT_EDGE_TYPE.abbr };
+        edgeTypes[from + '->' + to] = norm;
+        return;
+      }
+
+      // Generic node without label
+      m = line.match(/^"([^"]+)"\\s*\\[/);
+      if (m && line.indexOf('->') === -1) {
+        var id2 = unquote(m[1]);
+        if (!full[id2]) full[id2] = []; if (!rev[id2]) rev[id2] = [];
       }
     }
-    return { order, edges, levels, parent };
-  }
 
-  function buildPathsFor(nodesSet, parentMap) {
-    const out = new Map();
-    for (const n of nodesSet) {
-      const p = []; let cur = n;
-      while (cur !== undefined) { p.unshift(cur); cur = parentMap.get(cur); }
-      out.set(n, p);
+    // Traversals
+    function traverseDFS(graphObj, start, maxDepth, direction, edgeTypes) {
+      var stack = [[start, 0]];
+      var visited = new Set();
+      var order = [];
+      var edges = [];
+      var levels = new Map([[start, 0]]);
+      var parent = new Map();
+
+      while (stack.length) {
+        var cur = stack.pop();
+        var node = cur[0], depth = cur[1];
+        if (visited.has(node)) continue;
+        visited.add(node);
+        order.push(node);
+
+        var neighbors = graphObj[node] || [];
+        for (var i = neighbors.length - 1; i >= 0; i--) {
+          var nb = neighbors[i];
+          if (nb === node) continue;
+          var key = (direction === 'upstream') ? (nb + '->' + node) : (node + '->' + nb);
+          var norm = edgeTypes[key] || DEFAULT_EDGE_TYPE;
+          var edge = (direction === 'upstream')
+            ? {from: nb, to: node, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr}
+            : {from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr};
+          edges.push(edge);
+          if (!visited.has(nb) && depth + 1 <= maxDepth) {
+            if (!levels.has(nb)) levels.set(nb, depth + 1);
+            if (!parent.has(nb)) parent.set(nb, node);
+            stack.push([nb, depth + 1]);
+          }
+        }
+      }
+      return { order: order, edges: edges, levels: levels, parent: parent };
     }
-    return out;
-  }
 
-  function dedupeEdges(edges) {
-    const seen = new Set(), out = [];
-    for (const e of edges) {
-      if (e.from === e.to) continue; // self-loop guard
-      const key = \`\${e.from}->\${e.to}\`;
-      if (seen.has(key)) continue;
-      seen.add(key); out.push(e);
+    function traverseBFS(graphObj, start, maxDepth, direction, edgeTypes) {
+      var queue = [[start, 0]];
+      var qi = 0;
+      var visited = new Set([start]);
+      var order = [];
+      var edges = [];
+      var levels = new Map([[start, 0]]);
+      var parent = new Map();
+
+      while (qi < queue.length) {
+        var pair = queue[qi++], node = pair[0], depth = pair[1];
+        order.push(node);
+        var neighbors = graphObj[node] || [];
+        for (var i=0;i<neighbors.length;i++){
+          var nb = neighbors[i];
+          if (nb === node) continue;
+          var key = (direction === 'upstream') ? (nb + '->' + node) : (node + '->' + nb);
+          var norm = edgeTypes[key] || DEFAULT_EDGE_TYPE;
+          var edge = (direction === 'upstream')
+            ? {from: nb, to: node, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr}
+            : {from: node, to: nb, level: depth + 1, etype: norm.type, etypeAbbr: norm.abbr};
+          edges.push(edge);
+          if (!visited.has(nb) && depth + 1 <= maxDepth) {
+            visited.add(nb);
+            levels.set(nb, depth + 1);
+            if (!parent.has(nb)) parent.set(nb, node);
+            queue.push([nb, depth + 1]);
+          }
+        }
+      }
+      return { order: order, edges: edges, levels: levels, parent: parent };
     }
-    return out;
-  }
 
-  function generateTraversalDot(order, edges, algorithm, startNode, direction, nodeLevels, nodePaths, labels) {
-    const isDown = direction === 'downstream';
-    const sanitize = s => (s || '').replace(/[^a-zA-Z0-9._-]/g, '_');
-    const graphTitle = isDown ? \`Forward_Subgraph_Analysis_of_\${sanitize(startNode)}\` : \`Backward_Subgraph_Analysis_of_\${sanitize(startNode)}\`;
-    const out = [];
-    out.push(\`digraph "\${graphTitle}" {\`);
-    out.push(\`  node [shape=box, style=filled];\`);
-    out.push(\`  edge [color=blue];\`);
-    out.push('');
-    out.push(\`  // Nodes visited: \${order.length}\`);
-    out.push(\`  // Edges found: \${edges.length}\`);
-    const maxLevel = nodeLevels ? Math.max(...nodeLevels.values()) : 0; out.push(\`  // Maximum depth: \${maxLevel} levels\`);
-    const extremeNodes = []; if (nodeLevels) for (const [n,l] of nodeLevels.entries()) if (l===maxLevel) extremeNodes.push(n);
-    if (extremeNodes.length) out.push(\`  // \${isDown ? 'Terminal nodes' : 'Base models'}: \${extremeNodes.join(', ')}\`);
-    out.push('');
-    if (nodePaths && extremeNodes.length) {
-      out.push(\`  // \${isDown ? 'Paths to terminal nodes' : 'Paths to base models'}:\`);
-      extremeNodes.forEach(n => { const p = nodePaths.get(n); if (p) out.push(\`  // \${n}: \${p.join(' -> ')} (\${p.length - 1} steps)\`); });
+    function buildPathsFor(nodesArr, parentMap) {
+      var out = new Map();
+      for (var i=0;i<nodesArr.length;i++) {
+        var n = nodesArr[i];
+        var p = []; var cur = n;
+        while (typeof cur !== 'undefined') { p.unshift(cur); cur = parentMap.get(cur); }
+        out.set(n, p);
+      }
+      return out;
+    }
+
+    function dedupeEdges(edges) {
+      var seen = new Set(), out = [];
+      for (var i=0;i<edges.length;i++) {
+        var e = edges[i];
+        if (e.from === e.to) continue;
+        var key = e.from + '->' + e.to;
+        if (seen.has(key)) continue;
+        seen.add(key); out.push(e);
+      }
+      return out;
+    }
+
+    function generateTraversalDot(order, edges, algorithm, startNode, direction, nodeLevels, nodePaths, labels) {
+      var isDown = (direction === 'downstream');
+      function sanitize(s){ return (s || '').replace(/[^a-zA-Z0-9._-]/g, '_'); }
+      var graphTitle = isDown ? ('Forward_Subgraph_Analysis_of_' + sanitize(startNode)) : ('Backward_Subgraph_Analysis_of_' + sanitize(startNode));
+      var out = [];
+      out.push('digraph "' + graphTitle + '" {');
+      out.push('  node [shape=box, style=filled];');
+      out.push('  edge [color=blue];');
       out.push('');
+      out.push('  // Nodes visited: ' + order.length);
+      out.push('  // Edges found: ' + edges.length);
+      var maxLevel = nodeLevels.size ? Math.max.apply(null, Array.from(nodeLevels.values())) : 0;
+      out.push('  // Maximum depth: ' + maxLevel + ' levels');
+      var extremeNodes = [];
+      nodeLevels.forEach(function(l, n){ if (l === maxLevel) extremeNodes.push(n); });
+      if (extremeNodes.length) out.push('  // ' + (isDown ? 'Terminal nodes' : 'Base models') + ': ' + extremeNodes.join(', '));
+      out.push('');
+      if (nodePaths && extremeNodes.length) {
+        out.push('  // ' + (isDown ? 'Paths to terminal nodes' : 'Paths to base models') + ':');
+        for (var i=0;i<extremeNodes.length;i++){
+          var n = extremeNodes[i];
+          var p = nodePaths.get(n);
+          if (p) out.push('  // ' + n + ': ' + p.join(' -> ') + ' (' + (p.length - 1) + ' steps)');
+        }
+        out.push('');
+      }
+      if (nodeLevels.size) {
+        var groups = {};
+        nodeLevels.forEach(function(l, n){ (groups[l] || (groups[l] = [])).push(n); });
+        for (var l=0; l<=maxLevel; l++) {
+          if (groups[l] && groups[l].length) {
+            out.push('  { rank=same; ' + groups[l].map(function(n){ return quoteId(n); }).join('; ') + '; }');
+          }
+        }
+        out.push('');
+      }
+      var levelColors = ['red','orange','yellow','lightgreen','lightblue','lightpink','lavender','lightcyan','lightgray'];
+      for (var k=0; k<order.length; k++) {
+        var node = order[k];
+        var level = nodeLevels.get(node) || 0;
+        var color = levelColors[level % levelColors.length];
+        var display = (labels[node] || node);
+        var path = nodePaths ? nodePaths.get(node) : null;
+        var steps = path ? (path.length - 1) : 0;
+        var isExtreme = (level === maxLevel);
+        var marker = isDown ? '[TERMINAL]' : '[BASE]';
+        var label = escLbl(display) + '\\\\nLevel: ' + level + (steps ? ('\\\\nSteps: ' + steps) : '') + (isExtreme ? ('\\\\n' + marker) : '');
+        var nodeStyle = isExtreme ? ', style="filled,bold", penwidth=3' : '';
+        out.push('  ' + quoteId(node) + ' [fillcolor=' + color + ', label="' + label + '"' + nodeStyle + '];');
+      }
+      out.push('');
+      out.push('  // Edges with level and type');
+      var seen = new Set();
+      for (var j=0; j<edges.length; j++) {
+        var e = edges[j];
+        if (e.source === e.target) continue;
+        var key = e.source + '->' + e.target;
+        if (seen.has(key)) continue; seen.add(key);
+        var parts = [];
+        if (typeof e.level !== 'undefined') parts.push('L' + e.level);
+        parts.push(e.etypeAbbr || DEFAULT_EDGE_TYPE.abbr);
+        var lbl = ' [label="' + parts.join(' | ') + '"]';
+        out.push('  ' + quoteId(e.source) + ' -> ' + quoteId(e.target) + lbl + ';');
+      }
+      out.push('}');
+      return out.join('\\n');
     }
-    if (nodeLevels) { const groups = {}; for (const [n,l] of nodeLevels.entries()) (groups[l] ||= []).push(n); for (let l=0;l<=maxLevel;l++){ if (groups[l]?.length) out.push(\`  { rank=same; \${groups[l].map(n => quoteId(n)).join('; ')}; }\`); } out.push(''); }
-    const levelColors = ['red','orange','yellow','lightgreen','lightblue','lightpink','lavender','lightcyan','lightgray'];
-    for (const node of order) {
-      const level = nodeLevels?.get(node) ?? 0; const color = levelColors[level % levelColors.length];
-      const display = labels?.[node] || node;
-      const path = nodePaths?.get(node); const steps = path ? path.length - 1 : 0;
-      const isExtreme = level === maxLevel; const marker = isDown ? '[TERMINAL]' : '[BASE]';
-      const label = \`\${escLbl(display)}\\\\nLevel: \${level}\${steps ? \`\\\\nSteps: \${steps}\` : ''}\${isExtreme ? \`\\\\n\${marker}\` : ''}\`;
-      const nodeStyle = isExtreme ? \`, style="filled,bold", penwidth=3\` : '';
-      out.push(\`  \${quoteId(node)} [fillcolor=\${color}, label="\${label}"\${nodeStyle}];\`);
-    }
-    out.push('');
-    out.push(\`  // Edges with level and type\`);
-    const seen = new Set();
-    for (const e of edges) {
-      if (e.source === e.target) continue;
-      const key = \`\${e.source}->\${e.target}\`; if (seen.has(key)) continue; seen.add(key);
-      const parts = [];
-      if (e.level !== undefined) parts.push(\`L\${e.level}\`);
-      if (e.etypeAbbr) parts.push(e.etypeAbbr);
-      const lbl = parts.length ? \` [label="\${parts.join(' | ')}"]\` : '';
-      out.push(\`  \${quoteId(e.source)} -> \${quoteId(e.target)}\${lbl};\`);
-    }
-    out.push('}');
-    return out.join('\\n');
-  }
+  })();
 `;
 
 /* =========================
-   END worker source string
+   END
    ========================= */

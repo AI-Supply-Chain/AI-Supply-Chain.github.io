@@ -3,117 +3,143 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Supply Chain Graph Visualization and Analysis</title>
+  <title>AI Supply Chain Graph — Landing</title>
+  <meta name="description" content="Interactive analysis of AI model supply chains using directed graph traversal and layered visualization." />
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
-  <div class="container">
-    <!-- HEADER -->
-    <div class="header">
-      <h1>AI Supply Chain Graph Analysis</h1>
-      <!-- <p>HuggingGraph: Understanding the Supply Chain of LLM Ecosystem</p> -->
-    </div>
 
-    <!-- FILE PATH CONFIG -->
-    <div class="file-path-section">
-      <div class="input-group">
-        <label for="filePath">📁 Graph File Path</label>
-        <input type="text" id="filePath" placeholder="Path to the .dot file" value="AI-Supply-Chain-Graph.dot" />
-        <small class="hint">Point this to your actual DOT file (served from the same origin).</small>
+  <!-- Top nav -->
+  <nav class="site-nav" aria-label="Primary">
+    <div class="brand">
+      <div class="brand-badge" aria-hidden="true">AI</div>
+      <div>AI Supply Chain Graph</div>
+    </div>
+    <div class="nav-actions">
+      <a class="btn-ghost small" href="app.html" title="Open the interactive app">Launch Simulation →</a>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero container">
+    <div class="hero-card card">
+      <div class="hero-head">
+        <h1 class="hero-title">Mapping AI Model Lineage &amp; Derivations</h1>
+        <p class="hero-sub">
+          Analyze  forward/downstream and backward/upstream supply chain relationships among AI models using directed graph traversal.
+          Explore fine-tuning, adapter, quantization, and merge lineages — then export ranked DOT subgraphs
+          for reproducible research.
+        </p>
+      </div>
+
+      <div class="hero-media">
+        <!-- Replace the src with your static figure asset -->
+        <img src="images/ai-supply-chain-land.png"
+             alt="Static visualization of the AI Supply Chain subgraph showing terminal nodes and edge labels." />
+      </div>
+
+      <div class="cta-row">
+        <a class="btn" href="app.html" title="Open the interactive simulator">🚀 Launch Simulation</a>
+        <a class="btn ghost" href="#manual">User Manual</a>
+        <div class="meta">Version 1.0 · © 2025 Graph Lab UTA</div>
       </div>
     </div>
+  </section>
 
-    <!-- INPUTS -->
-    <div class="input-section">
-      <div class="grid">
-        <div class="input-group">
-          <label for="algorithm">Direction of Traversal</label>
-          <select id="algorithm">
-            <option value="DFS">⬇️ Forward/Downstream Graph Analysis</option>
-            <option value="BFS">⬆️ Backward/Upstream Graph Analysis</option>
-          </select>
+  <!-- Main content -->
+  <main class="content container" id="manual">
+    <!-- User Manual -->
+    <article class="card">
+      <header class="card__header">User Manual</header>
+      <div class="pad">
+        <h3>1. Overview</h3>
+        <p>
+          The simulator performs targeted traversals on a large, precomputed AI model network stored in Graphviz
+          <code>.dot</code> format. Two traversal modes are supported: <strong>Forward/Downstream Traversal</strong> for downstream
+          derivations and <strong>Backward/Upstream Traversal </strong> for upstream provenance.
+        </p>
+
+        <h3>2. Quick Start</h3>
+        <ol>
+          <li>Click <strong>Launch Simulation</strong> to open the interactive app.</li>
+          <li>Ensure the <em>Graph File Path</em> points to your served <code>.dot</code> file (default:
+            <code>AI-Supply-Chain-Graph.dot</code>).</li>
+          <li>Choose a direction: <em>Forward/Downstream</em> or <em>Backward/Upstream</em>.</li>
+          <li>Type 2–3 characters in the model search box, select a model, then click <strong>Run Traversal</strong>.</li>
+          <li>Explore the visualization and copy/download the generated DOT subgraph.</li>
+        </ol>
+
+        <h3>3. Legend & Semantics</h3>
+        <div class="two-col">
+          <ul>
+            <li><strong>FT</strong> — Fine-tuned</li>
+            <li><strong>AD</strong> — Adapter (LoRA/QLoRA)</li>
+            <li><strong>QN</strong> — Quantization (incl. GGUF)</li>
+            <li><strong>MR</strong> — Merged models</li>
+          </ul>
+          <ul>
+            <li>Node color encodes <em>depth (level)</em>.</li>
+            <li>Red outline marks <em>extremes</em>:
+              terminal nodes in forward mode, base models in backward mode.</li>
+            <li>Edge labels show the abbreviations above.</li>
+          </ul>
         </div>
 
-        <!-- Direction (hidden, still in DOM) -->
-        <div class="input-group hidden-ui" aria-hidden="true">
-          <label for="direction">Select a Direction</label>
-          <select id="direction">
-            <option value="downstream">⬇️ Downstream</option>
-            <option value="upstream">⬆️ Upstream</option>
-          </select>
-        </div>
+        <h3>4. Data Requirements</h3>
+        <p>
+          Input must be a valid Graphviz <code>digraph</code>. Edges can provide <code>label=</code> attributes
+          (e.g., <code>label="finetune"</code>) to classify as FT/AD/QN/MR; otherwise a sensible default (FT) is applied.
+        </p>
 
-        <div class="input-group">
-          <label for="maxDepth">Desired Graph Level (1–50)</label>
-          <input type="number" id="maxDepth" value="5" min="1" max="50" />
-        </div>
+        <h3>5. Exported DOT</h3>
+        <p>
+          The app emits a compact DOT with level ranks, edge-type labels, and comments detailing node counts,
+          max depth, and paths to extremes (terminal/base).
+        </p>
 
-        <div class="input-group span-2">
-          <label for="startNodeTypeahead">Choose an AI model from the list</label>
-          <div class="select-row">
-            <input id="startNodeTypeahead" list="modelOptions" placeholder="Type to search models (e.g., llama, yi, mistral)" />
-            <datalist id="modelOptions"></datalist>
-            <button type="button" class="secondary" onclick="useSelectedStartNode()">☑️ Select</button>
-          </div>
-          <p class="helper-note" role="note">
-            After selecting an AI model, press <strong>Run Traversal</strong> to start the analysis.
-          </p>
-        </div>
+        <h3>6. Performance Tips</h3>
+        <ul>
+          <li>Large subgraphs automatically use Sigma/Graphology for fast rendering.</li>
+          <li>Use <em>Desired Graph Level</em> to cap traversal depth for responsiveness.</li>
+          <li>Edge labels are drawn for small graphs in SVG and for big graphs via Sigma edge labels.</li>
+        </ul>
 
-        <!-- Starting Model Name (hidden, still in DOM) -->
-        <div class="input-group span-2 hidden-ui" aria-hidden="true">
-          <label for="startNode">Starting Model Name</label>
-          <input type="text" id="startNode" placeholder="Enter a model present in the graph" />
-        </div>
-
-        <!-- Layout (hidden, still in DOM) -->
-        <div class="input-group hidden-ui" aria-hidden="true">
-          <label for="layout">Layout (Graphviz)</label>
-          <select id="layout" disabled>
-            <option value="dot">dot (hierarchical)</option>
-            <option value="neato">neato</option>
-            <option value="fdp">fdp</option>
-            <option value="circo">circo</option>
-            <option value="twopi">twopi</option>
-          </select>
-          <small class="hint">Disabled; we use D3 force layout and Sigma for performance.</small>
-        </div>
-      </div>
-    </div>
-
-    <!-- ACTION BUTTONS -->
-    <div class="button-group">
-      <button onclick="performTraversal()">🚀 Run Traversal</button>
-      <button onclick="clearResults()" class="secondary">🗑️ Clear</button>
-    </div>
-
-    <!-- STATUS -->
-    <div id="status" class="status" role="status" aria-live="polite"></div>
-
-    <!-- OUTPUT -->
-    <div class="output-section">
-      <div class="grid">
-        <div>
-          <h2>Visualization</h2>
-          <div id="graphviz-container">
-            <div style="text-align:center; padding:50px; color:#666;">Enter a model and click <em>Run Traversal</em></div>
-          </div>
-        </div>
-        <div>
-          <h2>DOT Format Output</h2>
-          <textarea class="dot-textarea" id="dotOutput" readonly></textarea>
-          <div style="margin-top:10px;">
-            <button onclick="copyDotFormat()" class="secondary">📋 Copy</button>
-            <button onclick="downloadDotFile()" class="secondary">⬇️ Download</button>
-          </div>
+        <h3>7. Troubleshooting</h3>
+        <div class="callout">
+          If the model isn’t found, verify its exact name in the typeahead list or confirm the DOT file contains the node.
+          For CORS or file load errors, ensure the DOT file is served from the same origin as the app.
         </div>
       </div>
-    </div>
-  </div>
+    </article>
 
-  <!-- LIBS -->
-  <script src="https://unpkg.com/d3@7/dist/d3.min.js" defer></script>
-  <script src="js/ui.js" defer></script>
-  <script src="js/graph-logic.js" defer></script>
+    <!-- About / Citation -->
+    <aside class="card">
+      <header class="card__header">About &amp; Citation</header>
+      <div class="pad">
+        <p>
+          <strong>AI Supply Chain Graph</strong> is a research tool for studying AI model lineage and derivative
+          relationships at scale.
+        </p>
+        <h3>Suggested Citation</h3>
+        <p class="callout" style="font-size:13.5px;">
+          Graph Lab UTA (2025). <em>Will be updated soon</em>.
+        </p>
+
+        <h3>Acknowledgments</h3>
+        <p>We thank the open-source Graphviz, D3, Sigma, and Graphology communities.</p>
+
+        <!-- <h3>Links</h3>
+        <ul>
+          <li><a href="app.html">Open the Simulator</a></li>
+          <li><a href="#manual">User Manual</a></li>
+        </ul> -->
+      </div>
+    </aside>
+  </main>
+
+  <footer class="footer container">
+    © 2025 Graph Lab UTA — AI Supply Chain Graph · All rights reserved
+  </footer>
 </body>
 </html>
