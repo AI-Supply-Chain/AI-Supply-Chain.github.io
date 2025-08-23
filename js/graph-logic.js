@@ -473,12 +473,13 @@ function injectBottomLegendBar(container, redMeaning) {
   row1.appendChild(chipWithLabel('FT','Fine-tuned'));
   row1.appendChild(chipWithLabel('AD','Adapter'));
   row1.appendChild(chipWithLabel('QN','Quantization'));
-  row1.appendChild(chipWithLabel('MR','Merged'));
+  // row1.appendChild(chipWithLabel('MR','Merged'));
 
   // --- Row 2: depth + red note ---
   const row2 = document.createElement('div');
   row2.style.cssText = 'display:flex; align-items:center; gap:12px; flex-wrap:wrap;';
 
+  row2.appendChild(chipWithLabel('MR','Merged')); 
   const depthLabel = document.createElement('span');
   depthLabel.textContent = 'Depth';
   depthLabel.style.cssText = 'font-size:12.5px; color:#344050; font-weight:500;';
