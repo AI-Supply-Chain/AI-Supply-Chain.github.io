@@ -51,6 +51,13 @@ figure { margin:0; }
   padding: 22px;
 }
 
+.btn[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+
 /* ---- Header ------------------------------------------------------------- */
 .header {
   display:flex; justify-content:space-between; align-items:center;
