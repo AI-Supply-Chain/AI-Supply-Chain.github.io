@@ -9,6 +9,9 @@ window.fullGraph = window.fullGraph || {};
 window.reverseGraph = window.reverseGraph || {};
 window.lastDirection = window.lastDirection || 'downstream';
 
+/* -------------------------------
+   Status
+-------------------------------- */
 function showStatus(message, type) {
   const el = document.getElementById('status');
   if (!el) return;
@@ -16,17 +19,82 @@ function showStatus(message, type) {
   el.className = `status ${type || ''}`;
   el.style.display = message ? 'block' : 'none';
 }
+window.showStatus = showStatus;
 
-function clearResults() {
-  const container = document.getElementById('graphviz-container');
-  if (container) {
-    container.innerHTML = '<div style="text-align:center; padding:50px; color:#666;">Enter a model and run traversal</div>';
-  }
-  const out = document.getElementById('dotOutput');
-  if (out) out.value = '';
-  showStatus('Results cleared', 'success');
+/* -------------------------------
+   Run button enable/disable
+-------------------------------- */
+function setRunEnabled(on) {
+  const btn = document.getElementById('runBtn');
+  if (!btn) return;
+  btn.disabled = !on;
+  btn.style.opacity = on ? '1' : '0.55';
+  btn.style.cursor = on ? 'pointer' : 'not-allowed';
 }
+window.setRunEnabled = setRunEnabled;
 
+/* Enable/disable Run based on typing */
+window.addEventListener('DOMContentLoaded', () => {
+  const typeInput = document.getElementById('startNodeTypeahead');
+  if (!typeInput) return;
+
+  // initial: if empty, disable Run
+  setRunEnabled(!!typeInput.value.trim());
+
+  typeInput.addEventListener('input', () => {
+    const hasText = !!typeInput.value.trim();
+    setRunEnabled(hasText); // you can require "Select" click if you prefer
+  });
+});
+
+/* -------------------------------
+   Clear workflow (rewritten)
+-------------------------------- */
+function clearResults() {
+  try {
+    // 1) Cancel any current traversal
+    if (typeof window.cancelCurrentRun === 'function') {
+      window.cancelCurrentRun();
+    }
+
+    // 2) Reset model inputs and datalist
+    const typeInput = document.getElementById('startNodeTypeahead');
+    const startField = document.getElementById('startNode'); // hidden
+    const datalist = document.getElementById('modelOptions');
+
+    if (typeInput) typeInput.value = '';
+    if (startField) startField.value = '';
+    if (datalist) datalist.innerHTML = '';
+
+    // 3) Reset visualization surface
+    if (typeof window.resetVisualization === 'function') {
+      window.resetVisualization();
+    } else {
+      // fallback
+      const container = document.getElementById('graphviz-container');
+      if (container) container.innerHTML = '<div class="placeholder">Pick a model and click <em>Run Traversal</em></div>';
+    }
+
+    // 4) Clear DOT output
+    const out = document.getElementById('dotOutput');
+    if (out) out.value = '';
+
+    // 5) Disable Run until a model is picked again
+    setRunEnabled(false);
+
+    // 6) Status + focus
+    showStatus('Cleared. Pick a model to run a new traversal.', 'success');
+    if (typeInput) typeInput.focus();
+  } catch (e) {
+    console.error(e);
+    showStatus('Clear failed: ' + e.message, 'error');
+  }
+}
+window.clearResults = clearResults;
+
+/* -------------------------------
+   Copy / Download / Stats
+-------------------------------- */
 async function copyDotFormat() {
   const ta = document.getElementById('dotOutput');
   if (!ta || !ta.value) {
@@ -46,6 +114,7 @@ async function copyDotFormat() {
     showStatus(`Copy failed: ${e.message}`, 'error');
   }
 }
+window.copyDotFormat = copyDotFormat;
 
 function downloadDotFile() {
   const text = document.getElementById('dotOutput')?.value || '';
@@ -60,7 +129,6 @@ function downloadDotFile() {
     .replace(/[^a-zA-Z0-9_]/g, '_');
 
   const algo = document.getElementById('algorithm')?.value; // 'DFS' or 'BFS'
-  // Match graph-logic.js original naming to avoid behavior change
   const filename = (algo === 'DFS')
     ? `Forward_analysis_of_${modelSafe}.dot`
     : `Backward_analysis_of_${modelSafe}.dot`;
@@ -74,6 +142,7 @@ function downloadDotFile() {
 
   showStatus(`Saved: ${filename}`, 'success');
 }
+window.downloadDotFile = downloadDotFile;
 
 function showGraphStats() {
   const nodeCount = Object.keys(window.fullGraph || {}).length;
@@ -98,10 +167,4 @@ function showGraphStats() {
     'success'
   );
 }
-
-/* Expose to window for inline handlers and graph-logic.js */
-window.showStatus = showStatus;
-window.clearResults = clearResults;
-window.copyDotFormat = copyDotFormat;
-window.downloadDotFile = downloadDotFile;
 window.showGraphStats = showGraphStats;
