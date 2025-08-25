@@ -16,14 +16,12 @@
       <a href="index.html" class="btn ghost back-home">← Back to Home</a>
     </div>
 
-    <!-- FILE PATH -->
-
-    <!-- FILE PATH -->
+    <!-- FILE PATH (kept hidden in UI) -->
     <div class="file-path-section hidden-ui" aria-hidden="true">
-    <div class="input-group">
+      <div class="input-group">
         <label for="filePath">📁 Graph File Path</label>
         <input type="text" id="filePath" placeholder="Path to the .dot file" value="AI-Supply-Chain-Graph.dot" />
-    </div>
+      </div>
     </div>
 
     <!-- INPUTS -->
@@ -66,8 +64,9 @@
             <datalist id="modelOptions"></datalist>
 
             <button type="button" class="btn secondary" onclick="useSelectedStartNode()">☑️ Select</button>
-            <button type="button" class="btn" onclick="performTraversal()">🚀 Run Traversal</button>
-            <button type="button" class="btn secondary" onclick="clearResults()">🗑️ Clear</button>
+            <!-- NOTE: id="runBtn" so UI can disable/enable -->
+            <button type="button" id="runBtn" class="btn" onclick="performTraversal()">🚀 Run Traversal</button>
+            <button type="button" class="btn secondary" onclick="clearResults()">🗑️ Clear Results</button>
           </div>
           <p class="helper-note" role="note">
             Start typing to see suggestions. Click <strong>Select</strong> (or press Enter), then click <strong>Run Traversal</strong>.
@@ -129,7 +128,6 @@
           </header>
 
           <div class="codewrap">
-            <!-- <label for="dotOutput" class="sr-only">DOT output</label> -->
             <textarea class="dot-textarea code-surface" id="dotOutput" readonly></textarea>
           </div>
 
@@ -141,7 +139,6 @@
     </div>
   </div>
 
-  <!-- FOOTER (centered under the container) -->
   <footer class="site-footer">
     © 2025 Graph Lab UTA — AI Supply Chain Graph Analysis · All rights reserved
   </footer>
