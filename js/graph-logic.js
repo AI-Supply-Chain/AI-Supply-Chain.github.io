@@ -39,6 +39,44 @@ const MODE_CFG = {
 };
 
 /* =========================
+   DEMO DEFAULTS + URL HELPERS
+   ========================= */
+/** You can tweak these defaults. If URL has no overrides, we’ll use these. */
+const DEMO_DEFAULTS = {
+  direction: 'downstream', // 'downstream' | 'upstream'
+  algorithm: 'DFS',        // auto-derived from direction, kept for URL clarity
+  maxDepth: 5,
+  // If #filePath has a default value in app.html, we’ll prefer that.
+  // Otherwise we’ll use this if provided; leave blank to rely on HTML default.
+  filePath: '',
+  // If not provided via URL or HTML, we’ll pick the first model from the CSV list.
+  startNode: '6DammK9/danbooru2023-captions-1ktar',
+  autorun: true            // auto-run the demo once on first load (no URL params)
+};
+
+function getQS() {
+  return new URLSearchParams(window.location.search);
+}
+function readQS(key, fallback = null) {
+  const v = getQS().get(key);
+  return (v === null || v === undefined || v === '') ? fallback : v;
+}
+function writeQS(next, { replace = true } = {}) {
+  const qs = getQS();
+  Object.entries(next || {}).forEach(([k, v]) => {
+    if (v === undefined || v === null || v === '') qs.delete(k);
+    else qs.set(k, String(v));
+  });
+  const url = `${window.location.pathname}?${qs.toString()}`;
+  if (replace) history.replaceState(null, '', url);
+  else history.pushState(null, '', url);
+}
+function coerceInt(v, fallback) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/* =========================
    TYPEAHEAD CONFIG
    ========================= */
 const MODEL_CACHE = new Map();     // csv -> array of models
@@ -66,19 +104,30 @@ window.addEventListener('load', async () => {
       applyModeFromDirection(); // loads the proper CSV and clears selection
     };
 
-    algoSel?.addEventListener('change', syncAlgoToDirection);
-    dirSel?.addEventListener('change', applyModeFromDirection); // still supported
+    // URL ➜ controls (pre-seed before first sync so labels load correctly)
+    seedControlsFromURL(algoSel, dirSel);
+
+    algoSel?.addEventListener('change', () => {
+      // keep URL in sync immediately when the user changes Algorithm
+      writeQS({ algo: algoSel.value, dir: (algoSel.value === 'DFS' ? 'downstream' : 'upstream') });
+      syncAlgoToDirection();
+    });
+    dirSel?.addEventListener('change', () => {
+      writeQS({ dir: dirSel.value, algo: MODE_CFG[readDirectionValue()]?.algo || 'DFS' });
+      applyModeFromDirection();
+    });
 
     // Typeahead events
     typeInput?.addEventListener('input', () => {
       clearTimeout(debTimer);
       debTimer = setTimeout(updateTypeaheadSuggestions, 120);
+      enableRunButtonIfModelChosen();
     });
     typeInput?.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') { ev.preventDefault(); useSelectedStartNode(); }
     });
 
-    // Apply once at startup (from current #algorithm value)
+    // Apply once at startup (from current #algorithm value or seeded URL)
     syncAlgoToDirection();
 
     // Disable Graphviz layout control (we use D3 / Sigma)
@@ -86,12 +135,134 @@ window.addEventListener('load', async () => {
     if (layoutSel) layoutSel.disabled = true;
 
     initWorker();
+
+    // --- AUTO-RUN on first load (demo or URL-driven) ---
+    await maybeAutoRunDemo();
+
     showStatus('Ready — select a model and click Run Traversal', 'success');
   } catch (e) {
     console.error(e);
     showStatus('Init error: ' + e.message, 'error');
   }
 });
+
+/** Seed controls from the URL if present; fall back to HTML defaults. */
+function seedControlsFromURL(algoSel, dirSel) {
+  const qs = getQS();
+  const urlDir  = (qs.get('dir') || qs.get('direction') || '').toLowerCase();
+  const urlAlgo = (qs.get('algo') || qs.get('algorithm') || '').toUpperCase();
+  const urlDepth = qs.get('depth') || qs.get('maxDepth');
+  const urlFile  = qs.get('file') || qs.get('filePath');
+  const urlStart = qs.get('start') || qs.get('model') || qs.get('startNode');
+
+  // Direction/Algorithm (keep them consistent)
+  if (urlAlgo === 'DFS' || urlAlgo === 'BFS') {
+    if (algoSel) algoSel.value = urlAlgo;
+    if (dirSel) dirSel.value = (urlAlgo === 'DFS' ? 'downstream' : 'upstream');
+  } else if (urlDir === 'downstream' || urlDir === 'upstream') {
+    if (dirSel) dirSel.value = urlDir;
+    if (algoSel) algoSel.value = MODE_CFG[urlDir]?.algo || 'DFS';
+  }
+
+  // Depth
+  const depthInput = document.getElementById('maxDepth');
+  if (depthInput && urlDepth) depthInput.value = coerceInt(urlDepth, DEMO_DEFAULTS.maxDepth);
+
+  // File path
+  const fileInput = document.getElementById('filePath');
+  if (fileInput && urlFile) fileInput.value = urlFile;
+
+  // Start node typeahead field; we'll move it to hidden start field on run
+  const typeInput = document.getElementById('startNodeTypeahead');
+  if (typeInput && urlStart) typeInput.value = urlStart;
+
+  enableRunButtonIfModelChosen();
+}
+
+/** Decide whether to auto-run (URL or demo), populate sensible defaults, then run. */
+async function maybeAutoRunDemo() {
+  const qs = getQS();
+  const hasAnyURLSignal =
+    qs.has('file') || qs.has('filePath') || qs.has('start') || qs.has('model') ||
+    qs.has('startNode') || qs.has('dir') || qs.has('direction') ||
+    qs.has('algo') || qs.has('algorithm') || qs.has('depth') || qs.has('maxDepth');
+
+  const autorunParam = qs.get('autorun');
+  const shouldAutorun = (autorunParam === '1') || (!hasAnyURLSignal && DEMO_DEFAULTS.autorun);
+
+  // Ensure model list for the current mode is loaded before we pick a demo start node
+  await applyModeFromDirection();
+
+  // If fields are empty AND URL didn’t provide, fill demo defaults
+  const fileInput = document.getElementById('filePath');
+  const depthInput = document.getElementById('maxDepth');
+  const algoSel = document.getElementById('algorithm');
+  const dirSel  = document.getElementById('direction');
+  const typeInput = document.getElementById('startNodeTypeahead');
+
+  // Direction/Algorithm demo (only when no URL overrides)
+  if (!qs.get('dir') && !qs.get('direction') && dirSel) {
+    const demoDir = (DEMO_DEFAULTS.direction === 'upstream') ? 'upstream' : 'downstream';
+    dirSel.value = demoDir;
+    if (algoSel) algoSel.value = MODE_CFG[demoDir]?.algo || 'DFS';
+    window.lastDirection = demoDir;
+    // re-apply to load the correct CSV if we changed direction
+    await applyModeFromDirection();
+  }
+
+  // Depth demo
+  if (!qs.get('depth') && !qs.get('maxDepth') && depthInput) {
+    depthInput.value = coerceInt(DEMO_DEFAULTS.maxDepth, 5);
+  }
+
+  // File path demo
+  if (!qs.get('file') && !qs.get('filePath') && fileInput) {
+    // Prefer existing HTML default value if present; otherwise use DEMO_DEFAULTS.filePath
+    if (!fileInput.value && DEMO_DEFAULTS.filePath) fileInput.value = DEMO_DEFAULTS.filePath;
+  }
+
+  // Start node demo
+  if (!qs.get('start') && !qs.get('model') && !qs.get('startNode') && typeInput) {
+    if (!typeInput.value) {
+      // pick the first model from the loaded list as a safe default
+      const demoList = currentModelList();
+      if (demoList.length) typeInput.value = DEMO_DEFAULTS.startNode || demoList[0];
+      else if (DEMO_DEFAULTS.startNode) typeInput.value = DEMO_DEFAULTS.startNode;
+    }
+  }
+
+  enableRunButtonIfModelChosen();
+
+  if (!shouldAutorun) return;
+
+  // Move typeahead selection into the hidden field & run
+  useSelectedStartNode();
+
+  // Keep URL in sync before running (handy for refresh/share)
+  const direction = readDirectionValue();
+  const algorithm = MODE_CFG[direction]?.algo || 'DFS';
+  const maxDepth = document.getElementById('maxDepth')?.value ?? '';
+  const filePath = document.getElementById('filePath')?.value ?? '';
+  const startNode = document.getElementById('startNode')?.value ||
+                    document.getElementById('startNodeTypeahead')?.value || '';
+
+  writeQS({
+    autorun: 1,
+    dir: direction,
+    algo: algorithm,
+    depth: maxDepth,
+    file: filePath,
+    start: startNode
+  }, { replace: true });
+
+  // Fire the traversal
+  try {
+    await performTraversal();
+  } catch (e) {
+    console.error(e);
+    // Fail silently into ready state
+  }
+}
 
 /* =========================
    MODE/APPLY: set algo + csv, load model list
@@ -111,12 +282,12 @@ async function applyModeFromDirection() {
   const algoSel = document.getElementById('algorithm');
   if (algoSel) algoSel.value = cfg.algo;
 
-  // Clear current selection & suggestions
+  // Clear current selection & suggestions (typeahead UI only)
   const typeInput = document.getElementById('startNodeTypeahead');
   const startField = document.getElementById('startNode');
   const datalist = document.getElementById('modelOptions');
-  if (typeInput) typeInput.value = '';
-  if (startField) startField.value = '';
+  if (typeInput) typeInput.value = typeInput.value; // preserve what user typed
+  if (startField) startField.value = '';            // force re-selection
   if (datalist) datalist.innerHTML = '';
 
   window.lastDirection = cfg.direction;
@@ -204,9 +375,11 @@ function useSelectedStartNode() {
   const val = (input.value || '').trim();
   if (!val) {
     showStatus('Type a few characters and choose a model.', 'error');
+    disableRunButton();
     return;
   }
   startField.value = val;
+  enableRunButton();
   showStatus('Selected model: ' + val + '. Click Run Traversal.', 'success');
 }
 window.useSelectedStartNode = useSelectedStartNode;
@@ -237,6 +410,16 @@ async function performTraversal() {
 
   const fileURL = toAbsoluteURL(filePath);
 
+  // Keep URL in sync for refresh/shareability
+  writeQS({
+    dir: direction,
+    algo: algorithm,
+    depth: maxDepth,
+    file: filePath,
+    start: startNode,
+    autorun: 1
+  }, { replace: true });
+
   // cancel previous
   currentRunId++;
   initWorker();
@@ -252,6 +435,39 @@ async function performTraversal() {
   });
 }
 window.performTraversal = performTraversal;
+
+/* =========================
+   PUBLIC HELPERS (requested)
+   ========================= */
+/** Safely cancel any in-flight traversal: ignore future worker messages and stop the worker. */
+function cancelCurrentRun() {
+  try {
+    currentRunId++;             // future worker messages with old runId are ignored
+    if (worker) {
+      try { worker.terminate(); } catch {}
+      worker = null;            // ensure no more messages
+    }
+  } catch {}
+}
+window.cancelCurrentRun = cancelCurrentRun;
+
+/** Kill renderers & restore the blank placeholder surface. */
+function resetVisualization() {
+  const container = document.getElementById('graphviz-container');
+  if (!container) return;
+
+  // Kill Sigma if present
+  try { if (__sigmaRenderer && typeof __sigmaRenderer.kill === 'function') __sigmaRenderer.kill(); } catch {}
+  __sigmaRenderer = null;
+
+  // Run D3 cleanup if set
+  if (__d3Cleanup) { try { __d3Cleanup(); } catch {} ; __d3Cleanup = null; }
+
+  // Clear and restore the friendly placeholder
+  container.innerHTML = '<div class="placeholder">Pick a model and click <em>Run Traversal</em></div>';
+  try { container.scrollTop = 0; container.scrollLeft = 0; } catch {}
+}
+window.resetVisualization = resetVisualization;
 
 /* Optional: load full graph into the right panel (unchanged) */
 async function loadFullGraph() {
@@ -1227,6 +1443,22 @@ const WORKER_SOURCE = `
     }
   })();
 `;
+
+/* =========================
+   SMALL UTILS
+   ========================= */
+function enableRunButtonIfModelChosen() {
+  const v = (document.getElementById('startNodeTypeahead')?.value || '').trim();
+  if (v) enableRunButton(); else disableRunButton();
+}
+function enableRunButton() {
+  const btn = document.getElementById('runBtn');
+  if (btn) btn.disabled = false;
+}
+function disableRunButton() {
+  const btn = document.getElementById('runBtn');
+  if (btn) btn.disabled = true;
+}
 
 /* =========================
    END
